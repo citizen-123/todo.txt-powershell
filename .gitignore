@@ -1,0 +1,14 @@
+# Pester output
+tests/testresults.xml
+tests/coverage*.xml
+
+# Local todo data that might be created during manual testing
+todo.txt
+done.txt
+report.txt
+.todo/
+
+# Editor / OS cruft
+.vscode/
+*.bak
+.DS_Store

@@ -1,0 +1,34 @@
+# Example configuration for the PowerShell todo.txt CLI.
+#
+# This file uses the same `export VAR=value` syntax as the original todo.sh
+# todo.cfg, so existing configurations are largely compatible. Point todo.ps1
+# at it with `-d`, the TODOTXT_CFG_FILE environment variable, or place it at
+# one of the default search locations (see the README).
+
+# --- Locations --------------------------------------------------------------
+export TODO_DIR="$HOME/.todo"
+export TODO_FILE="$TODO_DIR/todo.txt"
+export DONE_FILE="$TODO_DIR/done.txt"
+export REPORT_FILE="$TODO_DIR/report.txt"
+
+# --- Behaviour --------------------------------------------------------------
+export TODOTXT_AUTO_ARCHIVE=1            # auto-archive completed tasks (-a/-A)
+export TODOTXT_DATE_ON_ADD=0             # prepend creation date on add (-t/-T)
+export TODOTXT_PRESERVE_LINE_NUMBERS=1   # keep line numbers stable (-n/-N)
+export TODOTXT_FORCE=0                    # skip confirmations (-f)
+export TODOTXT_PLAIN=0                    # 1 = no color (-p), 0 = color (-c)
+export TODOTXT_VERBOSE=1                  # 0 = quiet, 1 = normal, 2 = debug
+# export TODOTXT_PRIORITY_ON_ADD=A        # default priority for new tasks
+# export TODOTXT_DEFAULT_ACTION=ls        # action when run with no arguments
+
+# --- Colors (ANSI). Comment out for defaults. -------------------------------
+export PRI_A=$YELLOW
+export PRI_B=$GREEN
+export PRI_C=$LIGHT_BLUE
+export PRI_X=$WHITE
+export COLOR_DONE=$LIGHT_GREY
+export COLOR_PROJECT=$NONE
+export COLOR_CONTEXT=$NONE
+export COLOR_DATE=$NONE
+export COLOR_NUMBER=$NONE
+export COLOR_META=$NONE
