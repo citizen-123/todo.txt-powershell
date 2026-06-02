@@ -54,12 +54,32 @@ function Get-TodoPrefix {
     return $base.ToUpperInvariant()
 }
 
+function Split-TodoMarker {
+    <#
+        Splits an optional leading single-character status marker from a task.
+        Recognized markers are 'x ' (done) and 'i ' (in-progress). Everything that
+        reasons about a task's priority/date/text first skips this marker, so an
+        in-progress task such as "i (A) buy milk" still reports priority A and
+        sorts among its priority peers. The set is intentionally limited to {x, i}
+        so a real task beginning with a single-letter word (e.g. "a +proj") is
+        never mistaken for a marker.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Line)
+
+    if ($Line -match '^([xi] )') {
+        return [pscustomobject]@{ Marker = $Matches[1]; Rest = $Line.Substring(2) }
+    }
+    return [pscustomobject]@{ Marker = ''; Rest = $Line }
+}
+
 function Get-TodoPriority {
-    <# Returns the single-letter priority (A-Z) of a task line, or $null. #>
+    <# Returns the single-letter priority (A-Z) of a task line, or $null.
+       A leading status marker (x / i) is skipped first. #>
     [OutputType([string])]
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Line)
 
-    if ($Line -match '^\(([A-Z])\) ') { return $Matches[1] }
+    $rest = (Split-TodoMarker -Line $Line).Rest
+    if ($rest -match '^\(([A-Z])\) ') { return $Matches[1] }
     return $null
 }
 
@@ -83,15 +103,19 @@ function ConvertTo-TodoUppercasePriority {
 
 function Split-TodoPrefix {
     <#
-        Splits a task into its optional priority and creation-date prefixes and
-        the remaining text, mirroring todo.sh's priAndDateExpr. Priority/Date
-        include their trailing space (or are empty strings).
+        Splits a task into its optional leading status marker, priority and
+        creation-date prefixes, and the remaining text, mirroring todo.sh's
+        priAndDateExpr. Marker/Priority/Date include their trailing space (or are
+        empty strings). Callers that rebuild the line MUST re-emit Marker first,
+        otherwise an in-progress 'i ' marker is silently dropped.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Line)
 
+    $m = Split-TodoMarker -Line $Line
+    $marker = $m.Marker
     $priority = ''
     $date = ''
-    $rest = $Line
+    $rest = $m.Rest
     if ($rest -match '^(\([^)]\) )') {
         $priority = $Matches[1]
         $rest = $rest.Substring($priority.Length)
@@ -100,7 +124,7 @@ function Split-TodoPrefix {
         $date = $Matches[1]
         $rest = $rest.Substring($date.Length)
     }
-    return [pscustomobject]@{ Priority = $priority; Date = $date; Rest = $rest }
+    return [pscustomobject]@{ Marker = $marker; Priority = $priority; Date = $date; Rest = $rest }
 }
 
 #endregion
@@ -160,23 +184,24 @@ function Get-TodoColorMap {
     }
     if ($Plain) {
         $colors = @{}
-        foreach ($k in 'PRI_A', 'PRI_B', 'PRI_C', 'PRI_X', 'COLOR_DONE',
+        foreach ($k in 'PRI_A', 'PRI_B', 'PRI_C', 'PRI_X', 'COLOR_DONE', 'COLOR_INPROGRESS',
             'COLOR_PROJECT', 'COLOR_CONTEXT', 'COLOR_DATE', 'COLOR_NUMBER',
             'COLOR_META', 'DEFAULT') { $colors[$k] = '' }
         return $colors
     }
     return @{
-        PRI_A         = (& $code '1;33')   # yellow
-        PRI_B         = (& $code '0;32')   # green
-        PRI_C         = (& $code '1;34')   # light blue
-        PRI_X         = (& $code '1;37')   # white
-        COLOR_DONE    = (& $code '0;37')   # light grey
-        COLOR_PROJECT = ''
-        COLOR_CONTEXT = ''
-        COLOR_DATE    = ''
-        COLOR_NUMBER  = ''
-        COLOR_META    = ''
-        DEFAULT       = (& $code '0')
+        PRI_A            = (& $code '1;33')   # yellow
+        PRI_B            = (& $code '0;32')   # green
+        PRI_C            = (& $code '1;34')   # light blue
+        PRI_X            = (& $code '1;37')   # white
+        COLOR_DONE       = (& $code '0;37')   # light grey
+        COLOR_INPROGRESS = (& $code '1;36')   # light cyan
+        COLOR_PROJECT    = ''
+        COLOR_CONTEXT    = ''
+        COLOR_DATE       = ''
+        COLOR_NUMBER     = ''
+        COLOR_META       = ''
+        DEFAULT          = (& $code '0')
     }
 }
 
@@ -289,6 +314,10 @@ function New-TodoConfig {
         HideProjects            = $false
         HideContexts            = $false
         HidePriority            = $false
+        DateTags                = $false
+        InProgress              = $false
+        Git                     = $false
+        GitRemote               = ''
         Colors                  = (Get-TodoColorMap)
         RawConfig               = @{}
     }
@@ -313,6 +342,10 @@ function New-TodoConfig {
         TODOTXT_SIGIL_BEFORE_PATTERN  = { param($v) $cfg.SigilBeforePattern = $v }
         TODOTXT_SIGIL_VALID_PATTERN   = { param($v) $cfg.SigilValidPattern = $v }
         TODOTXT_SIGIL_AFTER_PATTERN   = { param($v) $cfg.SigilAfterPattern = $v }
+        TODOTXT_DATE_TAGS             = { param($v) $cfg.DateTags = ($v -eq '1') }
+        TODOTXT_IN_PROGRESS           = { param($v) $cfg.InProgress = ($v -eq '1') }
+        TODOTXT_GIT                   = { param($v) $cfg.Git = ($v -eq '1') }
+        TODOTXT_GIT_REMOTE            = { param($v) $cfg.GitRemote = $v }
     }
     foreach ($name in $envMap.Keys) {
         $val = [System.Environment]::GetEnvironmentVariable($name)
@@ -354,6 +387,10 @@ function New-TodoConfig {
                 'TODOTXT_SIGIL_BEFORE_PATTERN' { $cfg.SigilBeforePattern = $v }
                 'TODOTXT_SIGIL_VALID_PATTERN' { $cfg.SigilValidPattern = $v }
                 'TODOTXT_SIGIL_AFTER_PATTERN' { $cfg.SigilAfterPattern = $v }
+                'TODOTXT_DATE_TAGS' { $cfg.DateTags = ($v -eq '1') }
+                'TODOTXT_IN_PROGRESS' { $cfg.InProgress = ($v -eq '1') }
+                'TODOTXT_GIT' { $cfg.Git = ($v -eq '1') }
+                'TODOTXT_GIT_REMOTE' { $cfg.GitRemote = $v }
                 default {
                     if ($cfg.Colors.ContainsKey($k)) { $cfg.Colors[$k] = $v }
                 }
@@ -471,6 +508,18 @@ function Format-TodoDisplayLine {
     if ($full -match '^[0-9]+ x ') {
         $clr = $C.COLOR_DONE
     }
+    elseif ($full -match '^[0-9]+ i ') {
+        # in-progress: colour by priority when present, else the in-progress colour
+        if ($full -match '^[0-9]+ i \(([A-Z])\) ') {
+            $p = $Matches[1]
+            $clr = $C["PRI_$p"]
+            if ([string]::IsNullOrEmpty($clr)) { $clr = $C.PRI_X }
+        }
+        else {
+            $clr = $C.COLOR_INPROGRESS
+        }
+        if ($Config.HidePriority) { $full = $full -replace '^([0-9]+ i )\([A-Z]\) ', '$1' }
+    }
     elseif ($full -match '^[0-9]+ \(([A-Z])\) ') {
         $p = $Matches[1]
         $clr = $C["PRI_$p"]
@@ -544,7 +593,11 @@ function Format-TodoEntries {
 
     $comparison = [System.Comparison[object]] {
         param($a, $b)
-        $r = [string]::Compare($a.Text, $b.Text, [System.StringComparison]::OrdinalIgnoreCase)
+        # Skip a leading status marker (x / i) so in-progress and done tasks sort
+        # by their underlying priority/text rather than clustering under the marker.
+        $ka = (Split-TodoMarker -Line $a.Text).Rest
+        $kb = (Split-TodoMarker -Line $b.Text).Rest
+        $r = [string]::Compare($ka, $kb, [System.StringComparison]::OrdinalIgnoreCase)
         if ($r -eq 0) { $r = $a.Num.CompareTo($b.Num) }
         return $r
     }
@@ -597,6 +650,9 @@ function Add-TodoTask {
         if ($text -notmatch '^\([A-Z]\)') {
             $text = "($($Config.PriorityOnAdd)) $text"
         }
+    }
+    if ($Config.DateTags) {
+        $text = "$text added:$(Get-TodoDate)"
     }
 
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -708,6 +764,7 @@ function Invoke-TodoReplaceOrPrepend {
     $taskInput = ConvertTo-TodoCleanInput -Text $taskInput
 
     $orig = Split-TodoPrefix -Line $todo
+    $marker = $orig.Marker          # preserve a leading x / i status marker
     $priority = $orig.Priority
     $prepdate = $orig.Date
 
@@ -716,11 +773,11 @@ function Invoke-TodoReplaceOrPrepend {
         if ($repl.Date) { $prepdate = $repl.Date }
         if ($repl.Priority) { $priority = $repl.Priority }
         $taskInput = $repl.Rest
-        $newText = "$priority$prepdate$taskInput"
+        $newText = "$marker$priority$prepdate$taskInput"
     }
     else {
-        # prepend: priority + date + input + ' ' + remaining original text
-        $newText = "$priority$prepdate$taskInput $($orig.Rest)"
+        # prepend: marker + priority + date + input + ' ' + remaining original text
+        $newText = "$marker$priority$prepdate$taskInput $($orig.Rest)"
     }
 
     $lines = Read-TodoFile -Path $Config.TodoFile
@@ -755,13 +812,18 @@ function Invoke-TodoDone {
             Invoke-TodoDie "$(Get-TodoPrefix $Config.TodoFile): No task $item."
         }
         $todo = $lines[$idx]
-        if ($todo.StartsWith('x ')) {
+        $m = Split-TodoMarker -Line $todo
+        if ($m.Marker -eq 'x ') {
             Write-TodoWarning "TODO: $item is already marked done."
             continue
         }
         $now = Get-TodoDate
-        $stripped = $todo -replace '^\(.\) ', ''
-        $lines[$idx] = "x $now $stripped"
+        # Drop any leading status marker (e.g. in-progress 'i ') and the priority,
+        # then mark done. A started: tag inside the body is preserved.
+        $body = $m.Rest -replace '^\(.\) ', ''
+        $line = "x $now $body"
+        if ($Config.DateTags) { $line = "$line completed:$now" }
+        $lines[$idx] = $line
         if ($Config.Verbose -gt 0) {
             $messages.Add("$item $($lines[$idx])")
             $messages.Add("TODO: $item marked as done.")
@@ -771,6 +833,45 @@ function Invoke-TodoDone {
     foreach ($m in $messages) { $m }
 
     if ($Config.AutoArchive) { Invoke-TodoArchive -Config $Config }
+}
+
+function Invoke-TodoStart {
+    <#
+        Marks tasks in-progress by prepending an 'i ' status marker and appending a
+        started:<date> tag. The task's priority is preserved (stored after the
+        marker, e.g. "i (A) task started:2026-06-02"). Requires TODOTXT_IN_PROGRESS.
+    #>
+    param($Config, [string[]]$Params)
+    if (-not $Config.InProgress) {
+        Invoke-TodoDie "TODO: the 'start' action requires in-progress tracking (set TODOTXT_IN_PROGRESS=1)."
+    }
+    if ($Params.Count -eq 0) { Invoke-TodoDie 'usage: todo.ps1 start NR [NR ...]' }
+
+    $items = ($Params -join ' ') -split '[ ,]+' | Where-Object { $_ -ne '' }
+    $lines = Read-TodoFile -Path $Config.TodoFile
+
+    foreach ($item in $items) {
+        if ($item -notmatch '^[0-9]+$') { Invoke-TodoDie 'usage: todo.ps1 start NR [NR ...]' }
+        $idx = [int]$item - 1
+        if ($idx -lt 0 -or $idx -ge $lines.Count -or [string]::IsNullOrEmpty($lines[$idx])) {
+            Invoke-TodoDie "$(Get-TodoPrefix $Config.TodoFile): No task $item."
+        }
+        $m = Split-TodoMarker -Line $lines[$idx]
+        if ($m.Marker -eq 'i ') {
+            Write-TodoWarning "TODO: $item is already in progress."
+            continue
+        }
+        if ($m.Marker -eq 'x ') {
+            Write-TodoWarning "TODO: $item is already marked done."
+            continue
+        }
+        $lines[$idx] = "i $($m.Rest) started:$(Get-TodoDate)"
+        if ($Config.Verbose -gt 0) {
+            "$item $($lines[$idx])"
+            "TODO: $item marked in-progress."
+        }
+    }
+    Write-TodoFile -Path $Config.TodoFile -Lines $lines
 }
 
 function Invoke-TodoDeprioritize {
@@ -786,8 +887,9 @@ function Invoke-TodoDeprioritize {
         if ($idx -lt 0 -or $idx -ge $lines.Count -or [string]::IsNullOrEmpty($lines[$idx])) {
             Invoke-TodoDie "$(Get-TodoPrefix $Config.TodoFile): No task $item."
         }
-        if ($lines[$idx] -match '^\(.\) ') {
-            $lines[$idx] = $lines[$idx] -replace '^\(.\) ', ''
+        $m = Split-TodoMarker -Line $lines[$idx]
+        if ($m.Rest -match '^\(.\) ') {
+            $lines[$idx] = $m.Marker + ($m.Rest -replace '^\(.\) ', '')
             if ($Config.Verbose -gt 0) {
                 "$item $($lines[$idx])"
                 "TODO: $item deprioritized."
@@ -817,8 +919,9 @@ function Invoke-TodoPrioritize {
         }
         $oldpri = Get-TodoPriority -Line $lines[$idx]
         if ($oldpri -ne $newpri) {
-            $stripped = $lines[$idx] -replace '^\(.\) ', ''
-            $lines[$idx] = "($newpri) $stripped"
+            $m = Split-TodoMarker -Line $lines[$idx]
+            $stripped = $m.Rest -replace '^\(.\) ', ''
+            $lines[$idx] = $m.Marker + "($newpri) $stripped"
         }
         if ($Config.Verbose -gt 0) {
             "$item $($lines[$idx])"
@@ -869,7 +972,10 @@ function Invoke-TodoDelete {
     else {
         $term = $Params[1]
         $prefix = Split-TodoPrefix -Line $todo
-        $body = $todo.Substring($prefix.Priority.Length)  # keep date, drop only priority like todo.sh
+        # Preserve a leading status marker and the priority; remove the term from
+        # the rest (which still includes any creation date) like todo.sh.
+        $keep = $prefix.Marker + $prefix.Priority
+        $body = $todo.Substring($keep.Length)
         # The TERM is matched literally (todo.sh uses a BRE in which +, @ etc.
         # are literal); this keeps `del NR +project` / `del NR @context` working.
         $pattern = [regex]::Escape($term)
@@ -879,7 +985,7 @@ function Invoke-TodoDelete {
         }
         $newBody = [regex]::Replace($body, $pattern, '')
         $newBody = ($newBody -replace '\s{2,}', ' ').Trim()
-        $lines[$idx] = "$($prefix.Priority)$newBody"
+        $lines[$idx] = "$keep$newBody"
         Write-TodoFile -Path $Config.TodoFile -Lines $lines
         if ($Config.Verbose -gt 0) {
             "$item $todo"
@@ -1152,6 +1258,13 @@ function Get-TodoAddonPath {
 function Invoke-TodoAddon {
     param($Config, [string]$Path, [string[]]$Params)
 
+    # TODO_SH points at the real wrapper so add-ons can re-invoke built-ins via
+    # `& $env:TODO_SH command <action> ...` (the module lives in src/, the wrapper
+    # is one level up at the repo/install root).
+    $todoSh = 'todo.ps1'
+    $wrapper = Join-Path $PSScriptRoot '..' 'todo.ps1'
+    if ([System.IO.File]::Exists($wrapper)) { $todoSh = (Resolve-Path $wrapper).Path }
+
     # Expose the standard todo.sh add-on environment, but restore it afterwards
     # so running an add-on never mutates the caller's process environment.
     $exported = @{
@@ -1159,7 +1272,7 @@ function Invoke-TodoAddon {
         TODO_FILE   = $Config.TodoFile
         DONE_FILE   = $Config.DoneFile
         REPORT_FILE = $Config.ReportFile
-        TODO_SH     = 'todo.ps1'
+        TODO_SH     = $todoSh
     }
     $previous = @{}
     foreach ($name in $exported.Keys) {
@@ -1173,6 +1286,115 @@ function Invoke-TodoAddon {
         foreach ($name in $previous.Keys) {
             [System.Environment]::SetEnvironmentVariable($name, $previous[$name])
         }
+    }
+}
+
+#endregion
+
+#region Git integration ---------------------------------------------------------
+
+# Actions that change files on disk; only these trigger a git sync. Everything
+# else (list/help/etc.) is read-only. Includes canonical names and aliases
+# because the sync runs in Invoke-Todo against the raw action token.
+$script:TodoMutatingActions = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]@(
+        'add', 'a', 'addm', 'addto', 'append', 'app', 'prepend', 'prep', 'replace',
+        'del', 'rm', 'depri', 'dp', 'do', 'done', 'pri', 'p', 'move', 'mv',
+        'archive', 'deduplicate', 'report', 'start', 'ip'
+    ),
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+
+function Test-TodoMutatingAction {
+    <# True if the action name is one that writes to the todo files. #>
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Action)
+    return $script:TodoMutatingActions.Contains($Action)
+}
+
+function Test-TodoGitAvailable {
+    <# True when the git executable is on PATH. Mockable in tests. #>
+    [OutputType([bool])]
+    param()
+    return [bool](Get-Command git -ErrorAction SilentlyContinue)
+}
+
+function Invoke-TodoGitCommand {
+    <#
+        Runs `git -C <TodoDir> <args>` quietly, returning
+        @{ ExitCode = <int>; Output = <string> }. Never throws.
+    #>
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string[]]$GitArgs)
+
+    try {
+        $output = & git -C $Config.TodoDir @GitArgs 2>&1 | Out-String
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
+    }
+    catch {
+        return [pscustomobject]@{ ExitCode = -1; Output = "$_" }
+    }
+}
+
+function Test-TodoGitRepo {
+    <# True when TodoDir is inside a git work tree. #>
+    [OutputType([bool])]
+    param([Parameter(Mandatory)]$Config)
+    $r = Invoke-TodoGitCommand -Config $Config -GitArgs @('rev-parse', '--is-inside-work-tree')
+    return ($r.ExitCode -eq 0 -and $r.Output.Trim() -eq 'true')
+}
+
+function Sync-TodoGit {
+    <#
+        Commits (and optionally pushes) the todo directory after a mutating action.
+        No-op unless TODOTXT_GIT is enabled. Auto-initializes the repo (and adds the
+        configured remote) when needed. Any failure is reported via Write-TodoWarning
+        (which sets exit code 1) but never throws.
+    #>
+    param([Parameter(Mandatory)]$Config, [string]$Action = '')
+
+    if (-not $Config.Git) { return }
+    try {
+        if (-not (Test-TodoGitAvailable)) {
+            Write-TodoWarning 'TODO: git not found on PATH; skipping git sync.'
+            return
+        }
+        if (-not (Test-TodoGitRepo -Config $Config)) {
+            $init = Invoke-TodoGitCommand -Config $Config -GitArgs @('init', '--quiet')
+            if ($init.ExitCode -ne 0) {
+                Write-TodoWarning "TODO: git init failed: $($init.Output.Trim())"
+                return
+            }
+            if ($Config.GitRemote) {
+                Invoke-TodoGitCommand -Config $Config -GitArgs @('remote', 'add', 'origin', $Config.GitRemote) | Out-Null
+            }
+        }
+
+        $add = Invoke-TodoGitCommand -Config $Config -GitArgs @('add', '-A')
+        if ($add.ExitCode -ne 0) {
+            Write-TodoWarning "TODO: git add failed: $($add.Output.Trim())"
+            return
+        }
+
+        $stamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+        $message = "todo: $Action $stamp".Trim()
+        $commit = Invoke-TodoGitCommand -Config $Config -GitArgs @('commit', '--quiet', '-m', $message)
+        if ($commit.ExitCode -ne 0) {
+            # "nothing to commit" is normal (a no-op action) and not a failure.
+            if ($commit.Output -notmatch 'nothing to commit|no changes added|working tree clean') {
+                Write-TodoWarning "TODO: git commit failed: $($commit.Output.Trim())"
+            }
+            return
+        }
+
+        if ($Config.GitRemote) {
+            $push = Invoke-TodoGitCommand -Config $Config -GitArgs @('push', '--quiet')
+            if ($push.ExitCode -ne 0) {
+                Write-TodoWarning "TODO: git push failed: $($push.Output.Trim())"
+            }
+        }
+    }
+    catch {
+        Write-TodoWarning "TODO: git sync error: $($_.Exception.Message)"
     }
 }
 
@@ -1219,6 +1441,7 @@ function Get-TodoShortHelp {
     replace NR "UPDATED TODO"
     report
     shorthelp
+    start|ip NR [NR ...]              (requires TODOTXT_IN_PROGRESS)
 
   See "help" for more details.
 '@ -split "`n"
@@ -1278,6 +1501,10 @@ function Get-TodoHelp {
     TODOTXT_VERBOSE=1               is same as option -v
     TODOTXT_DISABLE_FILTER=1        is same as option -x
     TODOTXT_DEFAULT_ACTION=""       run this when called with no arguments
+    TODOTXT_DATE_TAGS=1             tag tasks with added:/completed: dates
+    TODOTXT_IN_PROGRESS=1           enable the start|ip action + started: tag
+    TODOTXT_GIT=1                   commit (and push) the todo dir after changes
+    TODOTXT_GIT_REMOTE=URL          remote to push to when git tracking is on
 '@ -split "`n"
 }
 
@@ -1361,6 +1588,14 @@ function Invoke-TodoAction {
     <# Dispatches a single resolved action against an initialized config. #>
     param($Config, [string]$Action, [string[]]$Params, [switch]$BuiltinOnly)
 
+    # Add-ons override built-ins (todo.sh behaviour): an actions-dir script whose
+    # name matches the action runs instead of the built-in. `command <action>`
+    # passes -BuiltinOnly and is the escape hatch to force the built-in.
+    if (-not $BuiltinOnly) {
+        $addon = Get-TodoAddonPath -Config $Config -Action $Action
+        if ($addon) { Invoke-TodoAddon -Config $Config -Path $addon -Params $Params; return }
+    }
+
     switch -Regex ($Action) {
         '^(add|a)$' { Invoke-TodoAdd -Config $Config -Params $Params; break }
         '^addm$' { Invoke-TodoAddMultiple -Config $Config -Params $Params; break }
@@ -1376,6 +1611,7 @@ function Invoke-TodoAction {
         '^(del|rm)$' { Invoke-TodoDelete -Config $Config -Params $Params; break }
         '^(depri|dp)$' { Invoke-TodoDeprioritize -Config $Config -Params $Params; break }
         '^(do|done)$' { Invoke-TodoDone -Config $Config -Params $Params; break }
+        '^(start|ip)$' { Invoke-TodoStart -Config $Config -Params $Params; break }
         '^help$' {
             if ($Params.Count -gt 0) { Get-TodoShortHelp } else { Get-TodoHelp }
             break
@@ -1406,10 +1642,7 @@ function Invoke-TodoAction {
         '^replace$' { Invoke-TodoReplaceOrPrepend -Config $Config -Action 'replace' -Params $Params; break }
         '^report$' { Invoke-TodoReport -Config $Config; break }
         default {
-            if (-not $BuiltinOnly) {
-                $addon = Get-TodoAddonPath -Config $Config -Action $Action
-                if ($addon) { Invoke-TodoAddon -Config $Config -Path $addon -Params $Params; break }
-            }
+            # Add-on lookup already happened above; an unknown action is an error.
             Invoke-TodoDie ((Get-TodoUsage) -join "`n")
         }
     }
@@ -1472,7 +1705,21 @@ function Invoke-Todo {
     }
 
     Initialize-TodoFiles -Config $config
-    Invoke-TodoAction -Config $config -Action $action -Params ([string[]]$params)
+    $output = Invoke-TodoAction -Config $config -Action $action -Params ([string[]]$params)
+
+    # Git sync after a successful mutating action. Resolve `command <action>` to
+    # its inner action, and conservatively sync for anything that isn't read-only
+    # (covers add-ons, which may edit the files).
+    if ($config.Git) {
+        $effective = if ($action -eq 'command' -and $params.Count -gt 0) { $params[0] } else { $action }
+        $readOnly = @('list', 'ls', 'listall', 'lsa', 'listpri', 'lsp', 'listproj', 'lsprj',
+            'listcon', 'lsc', 'listfile', 'lf', 'listaddons', 'help', 'shorthelp')
+        if ($effective -notin $readOnly) {
+            Sync-TodoGit -Config $config -Action $effective
+        }
+    }
+
+    $output
 }
 
 #endregion
@@ -1480,15 +1727,17 @@ function Invoke-Todo {
 Export-ModuleMember -Function @(
     'Invoke-Todo', 'Get-TodoExitCode',
     'Read-TodoFile', 'Write-TodoFile', 'Get-TodoPrefix', 'Get-TodoPriority',
-    'ConvertTo-TodoCleanInput', 'ConvertTo-TodoUppercasePriority', 'Split-TodoPrefix',
+    'ConvertTo-TodoCleanInput', 'ConvertTo-TodoUppercasePriority', 'Split-TodoPrefix', 'Split-TodoMarker',
     'ConvertFrom-TodoConfig', 'New-TodoConfig', 'Initialize-TodoFiles',
     'Get-TodoEntries', 'Test-TodoMatch', 'Format-TodoDisplayLine', 'Format-TodoEntries',
     'Get-TodoPadding', 'Get-TodoColorMap', 'Remove-TodoBlankLines',
     'Add-TodoTask', 'Get-TodoTaskText', 'Get-TodoSigilWords', 'Get-TodoDate',
     'Invoke-TodoAdd', 'Invoke-TodoAddMultiple', 'Invoke-TodoAddTo', 'Invoke-TodoAppend',
     'Invoke-TodoArchive', 'Invoke-TodoDeduplicate', 'Invoke-TodoDelete', 'Invoke-TodoDeprioritize',
-    'Invoke-TodoDone', 'Invoke-TodoList', 'Invoke-TodoListAll', 'Invoke-TodoListPriority',
+    'Invoke-TodoDone', 'Invoke-TodoStart', 'Invoke-TodoList', 'Invoke-TodoListAll', 'Invoke-TodoListPriority',
     'Invoke-TodoListAddons', 'Invoke-TodoMove', 'Invoke-TodoPrioritize', 'Invoke-TodoReplaceOrPrepend',
     'Invoke-TodoReport', 'Invoke-TodoAction', 'ConvertFrom-TodoArgument',
-    'Get-TodoUsage', 'Get-TodoShortHelp', 'Get-TodoHelp', 'Get-TodoVersion'
+    'Get-TodoUsage', 'Get-TodoShortHelp', 'Get-TodoHelp', 'Get-TodoVersion',
+    'Sync-TodoGit', 'Test-TodoGitAvailable', 'Test-TodoGitRepo', 'Invoke-TodoGitCommand',
+    'Test-TodoMutatingAction'
 )
