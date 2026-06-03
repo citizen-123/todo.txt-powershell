@@ -56,20 +56,40 @@ jobs:
         shell: pwsh
         run: pwsh -File tests/Invoke-Lint.ps1
 
+  clear-labels:
+    name: Clear status labels
+    # Runs immediately on each PR event (including a new push / synchronize) so a
+    # stale tests-passing / tests-failing label is cleared while the matrix
+    # re-runs. Same-repo PRs only (fork PRs get a read-only GITHUB_TOKEN).
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Remove existing status labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr edit "$PR" --repo "$REPO" --remove-label tests-passing || true
+          gh pr edit "$PR" --repo "$REPO" --remove-label tests-failing || true
+
   label:
-    name: tests-passing label
-    needs: pester
-    # Run after the whole Pester matrix on PRs (regardless of outcome) so the
-    # label is added when tests pass and removed when they don't. Skipped for
-    # pushes to main, where there is no PR to label, and for fork PRs whose
-    # GITHUB_TOKEN is read-only.
+    name: Status labels
+    needs: [pester, clear-labels]
+    # After the whole Pester matrix (regardless of outcome): apply tests-passing
+    # on success and a red tests-failing on failure, clearing the opposite.
+    # `needs: clear-labels` orders this after the stale-label clear. Skipped for
+    # pushes to main and for fork PRs (read-only token).
     if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     permissions:
       issues: write
       pull-requests: write
     steps:
-      - name: Update tests-passing label
+      - name: Apply pass/fail label
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
@@ -78,9 +98,13 @@ jobs:
         run: |
           gh label create tests-passing --repo "$REPO" --color 0e8a16 \
             --description "All CI tests passing" --force || true
+          gh label create tests-failing --repo "$REPO" --color d73a4a \
+            --description "CI tests failing" --force || true
           if [ "$RESULT" = "success" ]; then
-            gh pr edit "$PR" --repo "$REPO" --add-label tests-passing
+            gh pr edit "$PR" --repo "$REPO" --add-label tests-passing || true
+            gh pr edit "$PR" --repo "$REPO" --remove-label tests-failing || true
           else
+            gh pr edit "$PR" --repo "$REPO" --add-label tests-failing || true
             gh pr edit "$PR" --repo "$REPO" --remove-label tests-passing || true
           fi
 
