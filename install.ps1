@@ -7,7 +7,7 @@
         # interactive
         iwr https://raw.githubusercontent.com/citizen-123/todo.txt-powershell/main/install.ps1 | iex
 
-        # non-interactive (defaults) — set the env var first because a piped
+        # non-interactive (defaults) -- set the env var first because a piped
         # script cannot receive parameters directly:
         $env:TODO_INSTALL_DEFAULT='1'; iwr <url> | iex
 

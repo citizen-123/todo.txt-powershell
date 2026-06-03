@@ -120,7 +120,7 @@ Describe 'Unit: Test-TodoMatch (search filtering)' {
 
 # ----------------------------------------------------------------------------
 Describe 'Unit: Format-TodoDisplayLine' {
-    BeforeAll { $cfg = New-TodoConfig -TodoDir (Join-Path ([System.IO.Path]::GetTempPath()) 'fmt') -Overrides @{ Plain = $true } }
+    BeforeAll { $script:cfg = New-TodoConfig -TodoDir (Join-Path ([System.IO.Path]::GetTempPath()) 'fmt') -Overrides @{ Plain = $true } }
 
     It 'zero-pads the number to the requested width' {
         Format-TodoDisplayLine -Config $cfg -Num 3 -Text 'task' -Width 2 | Should -Be '03 task'
@@ -696,12 +696,9 @@ Describe 'Git tracking (mocked git)' {
         Should -Invoke -ModuleName TodoTxt Invoke-TodoGitCommand -ParameterFilter { $GitArgs[0] -eq 'commit' }
     }
     It 'does not run git for a read-only action' {
-        Invoke-T $d @('add', 'task') | Out-Null   # set up state
-        # Re-arm the mock counters by acting again on a read-only command.
-        $before = 0
-        Invoke-T $d @('ls') | Out-Null
+        Invoke-T $d @('add', 'task') | Out-Null   # one commit from the add
+        Invoke-T $d @('ls') | Out-Null            # read-only: must not commit
         Should -Invoke -ModuleName TodoTxt Invoke-TodoGitCommand -ParameterFilter { $GitArgs[0] -eq 'commit' } -Times 1 -Exactly
-        # exactly one commit total (from the add), none from ls
     }
     It 'pushes when a remote is configured' {
         $env:TODOTXT_GIT_REMOTE = 'git@example.com:me/todo.git'

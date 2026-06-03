@@ -364,7 +364,7 @@ function New-TodoConfig {
         [hashtable]$Overrides = @{}
     )
 
-    $home = if ($env:HOME) { $env:HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { [System.IO.Path]::GetTempPath() }
+    $homeDir = if ($env:HOME) { $env:HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { [System.IO.Path]::GetTempPath() }
 
     # --- defaults -----------------------------------------------------------
     $cfg = @{
@@ -436,10 +436,10 @@ function New-TodoConfig {
     if (-not $ConfigFile) { $ConfigFile = $env:TODOTXT_CFG_FILE }
     if (-not $ConfigFile) {
         $candidates = @(
-            (Join-Path $home '.todo/config'),
-            (Join-Path $home 'todo.cfg'),
-            (Join-Path $home '.todo.cfg'),
-            (Join-Path ($(if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $home '.config' })) 'todo/config')
+            (Join-Path $homeDir '.todo/config'),
+            (Join-Path $homeDir 'todo.cfg'),
+            (Join-Path $homeDir '.todo.cfg'),
+            (Join-Path ($(if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $homeDir '.config' })) 'todo/config')
         )
         foreach ($c in $candidates) { if ([System.IO.File]::Exists($c)) { $ConfigFile = $c; break } }
     }
@@ -499,7 +499,7 @@ function New-TodoConfig {
     }
 
     # --- derived paths ------------------------------------------------------
-    if (-not $cfg.TodoDir) { $cfg.TodoDir = (Join-Path $home '.todo') }
+    if (-not $cfg.TodoDir) { $cfg.TodoDir = (Join-Path $homeDir '.todo') }
     if (-not $cfg.TodoFile) { $cfg.TodoFile = (Join-Path $cfg.TodoDir 'todo.txt') }
     if (-not $cfg.DoneFile) { $cfg.DoneFile = (Join-Path $cfg.TodoDir 'done.txt') }
     if (-not $cfg.ReportFile) { $cfg.ReportFile = (Join-Path $cfg.TodoDir 'report.txt') }
@@ -823,7 +823,7 @@ function Invoke-TodoAppend {
     param($Config, [string[]]$Params)
     $usage = 'usage: todo.ps1 append NR "TEXT TO APPEND"'
     $item = if ($Params.Count -ge 1) { $Params[0] } else { '' }
-    $todo = Get-TodoTaskText -File $Config.TodoFile -Number $item -ErrorMessage $usage
+    $null = Get-TodoTaskText -File $Config.TodoFile -Number $item -ErrorMessage $usage  # validates the item exists
 
     if ($Params.Count -lt 2) {
         if ($Config.Force) { $taskInput = '' } else { $taskInput = Read-Host -Prompt 'Append' }
@@ -1521,7 +1521,7 @@ function Register-TodoArgumentCompleter {
                 [System.Management.Automation.CompletionResult]::new($c, $c, 'ParameterValue', $c)
             }
         }
-        catch { }
+        catch { $null = $_ }  # never let a completion error surface to the prompt
     }
     Register-ArgumentCompleter -CommandName $CommandName -ParameterName TodoArgs -ScriptBlock $block
     Register-ArgumentCompleter -CommandName 'Invoke-Todo' -ParameterName Arguments -ScriptBlock $block
