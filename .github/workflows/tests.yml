@@ -83,3 +83,51 @@ jobs:
           else
             gh pr edit "$PR" --repo "$REPO" --remove-label tests-passing || true
           fi
+
+  release:
+    name: Release on version bump
+    needs: pester
+    # On a push to main (i.e. a merged PR) with a green test matrix, cut a
+    # GitHub Release tagged v<ModuleVersion> -- but only when that version has no
+    # release yet, so ordinary merges that don't bump the manifest are no-ops.
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release for a new manifest version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $version = (Import-PowerShellDataFile ./src/TodoTxt.psd1).ModuleVersion
+          $tag = "v$version"
+
+          gh release view $tag --repo $env:REPO *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; nothing to do."
+            exit 0
+          }
+
+          # Use this version's CHANGELOG section as the release notes when present.
+          $notes = ""
+          if (Test-Path ./CHANGELOG.md) {
+            $lines = Get-Content ./CHANGELOG.md
+            $start = ($lines | Select-String -Pattern "^##\s*\[$([regex]::Escape($version))\]" | Select-Object -First 1).LineNumber
+            if ($start) {
+              $body = for ($i = $start; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^##\s*\[') { break }
+                $lines[$i]
+              }
+              $notes = ($body -join "`n").Trim()
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($notes)) { $notes = "Release $tag" }
+
+          $notesFile = New-TemporaryFile
+          Set-Content -Path $notesFile -Value $notes -Encoding utf8
+          gh release create $tag --repo $env:REPO --title $tag --notes-file $notesFile --target $env:GITHUB_SHA
+          Write-Host "Created release $tag."
