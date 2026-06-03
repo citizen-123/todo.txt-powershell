@@ -33,5 +33,25 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pester-results-${{ matrix.os }}
-          path: tests/testresults.xml
+          path: |
+            tests/testresults.xml
+            tests/coverage.xml
           if-no-files-found: ignore
+
+  lint:
+    name: PSScriptAnalyzer
+    runs-on: ubuntu-latest
+    # Non-blocking for now: the exclude list in PSScriptAnalyzerSettings.psd1 was
+    # chosen from a code read (the analyzer could not be run in the authoring
+    # sandbox). Flip to blocking once a clean baseline is confirmed here.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: pwsh -File tests/Invoke-Lint.ps1

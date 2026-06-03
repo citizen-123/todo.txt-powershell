@@ -80,4 +80,26 @@ Describe 'Add-TodoProfileFunction' {
         }
         finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
     }
+    It 'emits the tab-completer lines when -Completion is set' {
+        $dir = New-TestDir
+        try {
+            $profilePath = Join-Path $dir 'profile.ps1'
+            Add-TodoProfileFunction -ProfilePath $profilePath -WrapperPath '/opt/todo/todo.ps1' `
+                -ModulePath '/opt/todo/src/TodoTxt.psd1' -Completion
+            $content = Get-Content -Raw $profilePath
+            $content | Should -Match 'Import-Module "/opt/todo/src/TodoTxt.psd1"'
+            $content | Should -Match 'Register-TodoArgumentCompleter -CommandName todo'
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    It 'omits the completer lines when completion is not requested' {
+        $dir = New-TestDir
+        try {
+            $profilePath = Join-Path $dir 'profile.ps1'
+            Add-TodoProfileFunction -ProfilePath $profilePath -WrapperPath '/opt/todo/todo.ps1'
+            $content = Get-Content -Raw $profilePath
+            $content | Should -Not -Match 'Register-TodoArgumentCompleter'
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }

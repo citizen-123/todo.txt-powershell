@@ -127,6 +127,82 @@ function Split-TodoPrefix {
     return [pscustomobject]@{ Marker = $marker; Priority = $priority; Date = $date; Rest = $rest }
 }
 
+function Get-TodoTag {
+    <#
+        Returns the value of the first `key:value` tag whose key matches $Key
+        (todo.txt convention, e.g. due:2026-06-03 / t:2026-06-01 / rec:1w), or
+        $null when the tag is absent. The key must be a whole word (start of line
+        or preceded by whitespace) and the value is the run of non-space chars.
+    #>
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Line,
+        [Parameter(Mandatory)][string]$Key
+    )
+    $pattern = '(?:^|\s)' + [regex]::Escape($Key) + ':(\S+)'
+    $m = [regex]::Match($Line, $pattern)
+    if ($m.Success) { return $m.Groups[1].Value }
+    return $null
+}
+
+function Set-TodoTag {
+    <#
+        Replaces the value of an existing `key:value` tag in place, or appends a
+        new ` key:value` to the end when the tag is absent. Mirrors how the
+        community todo.txt tooling rewrites due:/t: tags on recurrence.
+    #>
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Line,
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$Value
+    )
+    $pattern = '((?:^|\s)' + [regex]::Escape($Key) + ':)(\S+)'
+    if ([regex]::IsMatch($Line, $pattern)) {
+        return [regex]::Replace($Line, $pattern, "`${1}$Value")
+    }
+    if ([string]::IsNullOrEmpty($Line)) { return "$Key`:$Value" }
+    return "$Line $Key`:$Value"
+}
+
+function ConvertTo-TodoDate {
+    <# Parses a strict yyyy-MM-dd date, returning a [datetime] or $null. #>
+    [OutputType([Nullable[datetime]])]
+    param([Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $null }
+    $d = [datetime]::MinValue
+    $ok = [datetime]::TryParseExact(
+        $Text, 'yyyy-MM-dd',
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::None, [ref]$d)
+    if ($ok) { return $d }
+    return $null
+}
+
+function Add-TodoDateInterval {
+    <#
+        Advances $Date by a todo.txt recurrence interval of the form <n><d|w|m|y>
+        (e.g. 3d, 2w, 1m, 1y). A leading '+' (strict recurrence) is accepted and
+        ignored here; the caller decides the base date. Throws on a malformed
+        interval so callers can guard and skip respawning.
+    #>
+    [OutputType([datetime])]
+    param(
+        [Parameter(Mandatory)][datetime]$Date,
+        [Parameter(Mandatory)][string]$Interval
+    )
+    if ($Interval -notmatch '^\+?([0-9]+)([dwmy])$') {
+        throw "Invalid recurrence interval '$Interval' (expected <n><d|w|m|y>)."
+    }
+    $n = [int]$Matches[1]
+    switch ($Matches[2]) {
+        'd' { return $Date.AddDays($n) }
+        'w' { return $Date.AddDays($n * 7) }
+        'm' { return $Date.AddMonths($n) }
+        'y' { return $Date.AddYears($n) }
+    }
+}
+
 #endregion
 
 #region Errors / messaging ------------------------------------------------------
@@ -316,6 +392,8 @@ function New-TodoConfig {
         HidePriority            = $false
         DateTags                = $false
         InProgress              = $false
+        Recurrence              = $false
+        HideFutureTasks         = $false
         Git                     = $false
         GitRemote               = ''
         Colors                  = (Get-TodoColorMap)
@@ -344,6 +422,8 @@ function New-TodoConfig {
         TODOTXT_SIGIL_AFTER_PATTERN   = { param($v) $cfg.SigilAfterPattern = $v }
         TODOTXT_DATE_TAGS             = { param($v) $cfg.DateTags = ($v -eq '1') }
         TODOTXT_IN_PROGRESS           = { param($v) $cfg.InProgress = ($v -eq '1') }
+        TODOTXT_RECURRENCE            = { param($v) $cfg.Recurrence = ($v -eq '1') }
+        TODOTXT_HIDE_FUTURE_TASKS     = { param($v) $cfg.HideFutureTasks = ($v -eq '1') }
         TODOTXT_GIT                   = { param($v) $cfg.Git = ($v -eq '1') }
         TODOTXT_GIT_REMOTE            = { param($v) $cfg.GitRemote = $v }
     }
@@ -389,6 +469,8 @@ function New-TodoConfig {
                 'TODOTXT_SIGIL_AFTER_PATTERN' { $cfg.SigilAfterPattern = $v }
                 'TODOTXT_DATE_TAGS' { $cfg.DateTags = ($v -eq '1') }
                 'TODOTXT_IN_PROGRESS' { $cfg.InProgress = ($v -eq '1') }
+                'TODOTXT_RECURRENCE' { $cfg.Recurrence = ($v -eq '1') }
+                'TODOTXT_HIDE_FUTURE_TASKS' { $cfg.HideFutureTasks = ($v -eq '1') }
                 'TODOTXT_GIT' { $cfg.Git = ($v -eq '1') }
                 'TODOTXT_GIT_REMOTE' { $cfg.GitRemote = $v }
                 default {
@@ -582,22 +664,35 @@ function Format-TodoEntries {
         [string]$PriorityFilter = $null
     )
 
+    $today = if ($Config.HideFutureTasks) { ConvertTo-TodoDate (Get-TodoDate) } else { $null }
+
     $filtered = [System.Collections.Generic.List[object]]::new()
     foreach ($e in $Entries) {
         if (-not (Test-TodoMatch -Text "$($e.Num) $($e.Text)" -Terms $Terms)) { continue }
         if ($PriorityFilter) {
             if ($e.Text -notmatch "^\([$PriorityFilter]\) ") { continue }
         }
+        # Threshold (t:) hiding: when enabled, drop undone tasks whose t: date is
+        # strictly in the future. Done tasks are never hidden.
+        if ($Config.HideFutureTasks -and (Split-TodoMarker -Line $e.Text).Marker -ne 'x ') {
+            $td = ConvertTo-TodoDate (Get-TodoTag -Line $e.Text -Key 't')
+            if ($null -ne $td -and $td -gt $today) { continue }
+        }
         $filtered.Add($e)
     }
 
+    # In-progress (i ) tasks sort by their underlying priority/text (skip the
+    # marker), but done (x ) tasks keep the marker in their key so they still
+    # cluster last exactly as todo.sh does.
+    $sortKey = {
+        param($t)
+        $m = Split-TodoMarker -Line $t
+        if ($m.Marker -eq 'i ') { return $m.Rest }
+        return $t
+    }
     $comparison = [System.Comparison[object]] {
         param($a, $b)
-        # Skip a leading status marker (x / i) so in-progress and done tasks sort
-        # by their underlying priority/text rather than clustering under the marker.
-        $ka = (Split-TodoMarker -Line $a.Text).Rest
-        $kb = (Split-TodoMarker -Line $b.Text).Rest
-        $r = [string]::Compare($ka, $kb, [System.StringComparison]::OrdinalIgnoreCase)
+        $r = [string]::Compare((& $sortKey $a.Text), (& $sortKey $b.Text), [System.StringComparison]::OrdinalIgnoreCase)
         if ($r -eq 0) { $r = $a.Num.CompareTo($b.Num) }
         return $r
     }
@@ -804,6 +899,7 @@ function Invoke-TodoDone {
     $items = ($Params -join ' ') -split '[ ,]+' | Where-Object { $_ -ne '' }
     $lines = Read-TodoFile -Path $Config.TodoFile
     $messages = [System.Collections.Generic.List[string]]::new()
+    $respawns = [System.Collections.Generic.List[string]]::new()
 
     foreach ($item in $items) {
         if ($item -notmatch '^[0-9]+$') { Invoke-TodoDie 'usage: todo.ps1 do NR [NR ...]' }
@@ -818,6 +914,24 @@ function Invoke-TodoDone {
             continue
         }
         $now = Get-TodoDate
+
+        # Recurrence (opt-in): a rec: tag spawns the task's next occurrence before
+        # this one is marked done. A leading '+' means strict (advance from the
+        # task's own due date) rather than from today.
+        if ($Config.Recurrence) {
+            $rec = Get-TodoTag -Line $todo -Key 'rec'
+            if ($rec) {
+                $respawn = New-TodoRecurrence -Rest $m.Rest -Rec $rec -Today $now -DateTags:$Config.DateTags
+                if ($respawn) {
+                    $respawns.Add($respawn)
+                    if ($Config.Verbose -gt 0) { $messages.Add("TODO: $item recurs as: $respawn") }
+                }
+                else {
+                    Write-TodoWarning "TODO: $item has an invalid rec: tag; not recurring."
+                }
+            }
+        }
+
         # Drop any leading status marker (e.g. in-progress 'i ') and the priority,
         # then mark done. A started: tag inside the body is preserved.
         $body = $m.Rest -replace '^\(.\) ', ''
@@ -829,10 +943,67 @@ function Invoke-TodoDone {
             $messages.Add("TODO: $item marked as done.")
         }
     }
+    if ($respawns.Count -gt 0) { $lines = [string[]]($lines + $respawns.ToArray()) }
     Write-TodoFile -Path $Config.TodoFile -Lines $lines
-    foreach ($m in $messages) { $m }
+    foreach ($msg in $messages) { $msg }
 
     if ($Config.AutoArchive) { Invoke-TodoArchive -Config $Config }
+}
+
+function New-TodoRecurrence {
+    <#
+        Builds the next occurrence of a recurring task. $Rest is the task text with
+        any status marker already stripped (priority kept). Returns the new task
+        line, or $null when the rec: interval is malformed. started:/completed:
+        tags are dropped; due:/t: are advanced (t: keeps its lead time relative to
+        due:); added: is refreshed to today when date tags are on.
+    #>
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Rest,
+        [Parameter(Mandatory)][string]$Rec,
+        [Parameter(Mandatory)][string]$Today,
+        [switch]$DateTags
+    )
+    $todayDate = ConvertTo-TodoDate $Today
+    $strict = $Rec.StartsWith('+')
+
+    $oldDue = ConvertTo-TodoDate (Get-TodoTag -Line $Rest -Key 'due')
+    $haveOldDue = $null -ne $oldDue
+
+    try {
+        $base = if ($strict -and $haveOldDue) { $oldDue } else { $todayDate }
+        $newDue = Add-TodoDateInterval -Date $base -Interval $Rec
+    }
+    catch {
+        return $null
+    }
+
+    $newText = $Rest
+    if ($haveOldDue) {
+        $newText = Set-TodoTag -Line $newText -Key 'due' -Value $newDue.ToString('yyyy-MM-dd')
+    }
+
+    # Advance a threshold (t:) tag, preserving its lead time before the due date
+    # when both dates are present; otherwise advance it by the same interval.
+    $oldT = ConvertTo-TodoDate (Get-TodoTag -Line $Rest -Key 't')
+    if ($null -ne $oldT) {
+        $newT = $null
+        if ($haveOldDue) {
+            $newT = $oldT.Add($newDue - $oldDue)
+        }
+        else {
+            $tBase = if ($strict) { $oldT } else { $todayDate }
+            try { $newT = Add-TodoDateInterval -Date $tBase -Interval $Rec } catch { $newT = $null }
+        }
+        if ($newT) { $newText = Set-TodoTag -Line $newText -Key 't' -Value $newT.ToString('yyyy-MM-dd') }
+    }
+
+    # Strip lifecycle markers that don't belong on a fresh occurrence.
+    $newText = ($newText -replace '(?:^|\s)(?:started|completed):\S+', '')
+    $newText = ($newText -replace '\s{2,}', ' ').Trim()
+    if ($DateTags) { $newText = Set-TodoTag -Line $newText -Key 'added' -Value $Today }
+    return $newText
 }
 
 function Invoke-TodoStart {
@@ -1136,6 +1307,59 @@ function Invoke-TodoList {
     }
 }
 
+function Invoke-TodoAgenda {
+    <#
+        Lists undone tasks that carry a due: tag, sorted by due date. With no
+        numeric argument it shows tasks due today or overdue; an optional leading
+        integer N widens the window to "overdue .. due within N days". Any further
+        arguments are treated as filter terms. Always available (a new command,
+        independent of the opt-in recurrence/threshold flags).
+    #>
+    param($Config, [string[]]$Params)
+
+    $horizon = $null
+    $terms = @()
+    if ($Params.Count -ge 1 -and $Params[0] -match '^[0-9]+$') {
+        $horizon = [int]$Params[0]
+        if ($Params.Count -gt 1) { $terms = $Params[1..($Params.Count - 1)] }
+    }
+    else {
+        $terms = $Params
+    }
+
+    $today = (ConvertTo-TodoDate (Get-TodoDate))
+    $cutoff = if ($null -ne $horizon) { $today.AddDays($horizon) } else { $today }
+
+    $lines = Read-TodoFile -Path $Config.TodoFile
+    $width = Get-TodoPadding -Lines $lines
+    $entries = Get-TodoEntries -Lines $lines
+
+    $matched = [System.Collections.Generic.List[object]]::new()
+    foreach ($e in $entries) {
+        if ((Split-TodoMarker -Line $e.Text).Marker -eq 'x ') { continue }
+        if (-not (Test-TodoMatch -Text "$($e.Num) $($e.Text)" -Terms $terms)) { continue }
+        $dueDate = ConvertTo-TodoDate (Get-TodoTag -Line $e.Text -Key 'due')
+        if ($null -eq $dueDate) { continue }
+        if ($dueDate -gt $cutoff) { continue }
+        $matched.Add([pscustomobject]@{ Num = $e.Num; Text = $e.Text; Due = $dueDate })
+    }
+
+    $matched.Sort([System.Comparison[object]] {
+            param($a, $b)
+            $r = $a.Due.CompareTo($b.Due)
+            if ($r -eq 0) { $r = $a.Num.CompareTo($b.Num) }
+            return $r
+        })
+
+    foreach ($e in $matched) {
+        Format-TodoDisplayLine -Config $Config -Num $e.Num -Text $e.Text -Width $width
+    }
+    if ($Config.Verbose -gt 0) {
+        '--'
+        "$(Get-TodoPrefix $Config.TodoFile): $($matched.Count) of $(@($entries).Count) tasks shown"
+    }
+}
+
 function Resolve-TodoListFile {
     [OutputType([string])]
     param($Config, [string]$Name)
@@ -1194,9 +1418,15 @@ function Invoke-TodoListPriority {
     }
 }
 
-function Get-TodoSigilWords {
-    <# todo.sh listWordsWithSigil(): unique tokens beginning with the sigil. #>
-    param($Config, [string]$Sigil, [string[]]$Terms)
+function Get-TodoSigilSet {
+    <#
+        Returns the sorted, de-duplicated set of tokens beginning with $Sigil
+        (e.g. +project / @context) drawn from the source file, honoring the
+        SIGIL_* patterns. Returned as a string[] so both the listing action and
+        the tab-completer can share the extraction.
+    #>
+    [OutputType([string[]])]
+    param($Config, [string]$Sigil, [string[]]$Terms = @())
 
     $file = $Config.TodoFile
     if ($Config.SourceVar) {
@@ -1218,7 +1448,83 @@ function Get-TodoSigilWords {
             }
         }
     }
-    foreach ($w in $found) { $w }
+    return [string[]]$found
+}
+
+function Get-TodoSigilWords {
+    <# todo.sh listWordsWithSigil(): prints unique tokens beginning with the sigil. #>
+    param($Config, [string]$Sigil, [string[]]$Terms)
+    foreach ($w in (Get-TodoSigilSet -Config $Config -Sigil $Sigil -Terms $Terms)) { $w }
+}
+
+# Canonical action tokens (names + aliases) for tab completion, mirroring the
+# dispatcher in Invoke-TodoAction.
+$script:TodoActionNames = @(
+    'add', 'a', 'addm', 'addto', 'agenda', 'due', 'append', 'app', 'archive',
+    'command', 'deduplicate', 'del', 'rm', 'depri', 'dp', 'do', 'done', 'help',
+    'list', 'ls', 'listall', 'lsa', 'listaddons', 'listcon', 'lsc', 'listfile',
+    'lf', 'listpri', 'lsp', 'listproj', 'lsprj', 'move', 'mv', 'prepend', 'prep',
+    'pri', 'p', 'replace', 'report', 'shorthelp', 'start', 'ip'
+) | Sort-Object -Unique
+
+function Get-TodoCompletion {
+    <#
+        Pure tab-completion core. Returns candidate strings for the word being
+        completed: action names at the first token position, +project / @context
+        tokens (filtered by prefix, read from the live file) when the word starts
+        with the matching sigil, and nothing otherwise.
+    #>
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [AllowEmptyString()][string]$WordToComplete = '',
+        [AllowEmptyCollection()][string[]]$CommandElements = @()
+    )
+
+    if ($WordToComplete.StartsWith('+')) {
+        return [string[]]@(Get-TodoSigilSet -Config $Config -Sigil '+' | Where-Object { $_.StartsWith($WordToComplete) })
+    }
+    if ($WordToComplete.StartsWith('@')) {
+        return [string[]]@(Get-TodoSigilSet -Config $Config -Sigil '@' | Where-Object { $_.StartsWith($WordToComplete) })
+    }
+
+    # Count tokens that precede the word being completed, ignoring the command
+    # name itself ([0]) and any leading -options. If none, we're at the action.
+    $priorArgs = @()
+    if ($CommandElements.Count -gt 1) {
+        $priorArgs = @($CommandElements[1..($CommandElements.Count - 1)] | Where-Object { $_ -notmatch '^-' })
+    }
+    $atAction = ($priorArgs.Count -eq 0) -or
+        ($priorArgs.Count -eq 1 -and $WordToComplete -ne '' -and $priorArgs[0] -eq $WordToComplete)
+    if ($atAction) {
+        return [string[]]@($script:TodoActionNames | Where-Object { $_.StartsWith($WordToComplete) })
+    }
+    return [string[]]@()
+}
+
+function Register-TodoArgumentCompleter {
+    <#
+        Registers a PowerShell tab-completer for the todo command(s) in the current
+        session (call it from your profile after importing the module). Completion
+        fires on the command's remaining-arguments parameter: the installer's
+        `todo` function exposes them as -TodoArgs, and Invoke-Todo as -Arguments.
+        All candidate logic is delegated to the pure Get-TodoCompletion.
+    #>
+    param([string]$CommandName = 'todo')
+
+    $block = {
+        param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+        try {
+            $config = New-TodoConfig
+            $elements = @($commandAst.CommandElements | ForEach-Object { $_.ToString() })
+            foreach ($c in (Get-TodoCompletion -Config $config -WordToComplete $wordToComplete -CommandElements $elements)) {
+                [System.Management.Automation.CompletionResult]::new($c, $c, 'ParameterValue', $c)
+            }
+        }
+        catch { }
+    }
+    Register-ArgumentCompleter -CommandName $CommandName -ParameterName TodoArgs -ScriptBlock $block
+    Register-ArgumentCompleter -CommandName 'Invoke-Todo' -ParameterName Arguments -ScriptBlock $block
 }
 
 function Invoke-TodoListAddons {
@@ -1417,6 +1723,7 @@ function Get-TodoShortHelp {
 
   Actions:
     add|a "THING I NEED TO DO +project @context"
+    agenda|due [N] [TERM...]
     addm "THINGS I NEED TO DO
           MORE THINGS I NEED TO DO"
     addto DEST "TEXT TO ADD"
@@ -1503,6 +1810,8 @@ function Get-TodoHelp {
     TODOTXT_DEFAULT_ACTION=""       run this when called with no arguments
     TODOTXT_DATE_TAGS=1             tag tasks with added:/completed: dates
     TODOTXT_IN_PROGRESS=1           enable the start|ip action + started: tag
+    TODOTXT_RECURRENCE=1            respawn rec:-tagged tasks when completed
+    TODOTXT_HIDE_FUTURE_TASKS=1     hide tasks whose t: date is in the future
     TODOTXT_GIT=1                   commit (and push) the todo dir after changes
     TODOTXT_GIT_REMOTE=URL          remote to push to when git tracking is on
 '@ -split "`n"
@@ -1612,6 +1921,7 @@ function Invoke-TodoAction {
         '^(depri|dp)$' { Invoke-TodoDeprioritize -Config $Config -Params $Params; break }
         '^(do|done)$' { Invoke-TodoDone -Config $Config -Params $Params; break }
         '^(start|ip)$' { Invoke-TodoStart -Config $Config -Params $Params; break }
+        '^(agenda|due)$' { Invoke-TodoAgenda -Config $Config -Params $Params; break }
         '^help$' {
             if ($Params.Count -gt 0) { Get-TodoShortHelp } else { Get-TodoHelp }
             break
@@ -1713,7 +2023,7 @@ function Invoke-Todo {
     if ($config.Git) {
         $effective = if ($action -eq 'command' -and $params.Count -gt 0) { $params[0] } else { $action }
         $readOnly = @('list', 'ls', 'listall', 'lsa', 'listpri', 'lsp', 'listproj', 'lsprj',
-            'listcon', 'lsc', 'listfile', 'lf', 'listaddons', 'help', 'shorthelp')
+            'listcon', 'lsc', 'listfile', 'lf', 'listaddons', 'agenda', 'due', 'help', 'shorthelp')
         if ($effective -notin $readOnly) {
             Sync-TodoGit -Config $config -Action $effective
         }
@@ -1728,13 +2038,15 @@ Export-ModuleMember -Function @(
     'Invoke-Todo', 'Get-TodoExitCode',
     'Read-TodoFile', 'Write-TodoFile', 'Get-TodoPrefix', 'Get-TodoPriority',
     'ConvertTo-TodoCleanInput', 'ConvertTo-TodoUppercasePriority', 'Split-TodoPrefix', 'Split-TodoMarker',
+    'Get-TodoTag', 'Set-TodoTag', 'Add-TodoDateInterval', 'ConvertTo-TodoDate', 'New-TodoRecurrence',
     'ConvertFrom-TodoConfig', 'New-TodoConfig', 'Initialize-TodoFiles',
     'Get-TodoEntries', 'Test-TodoMatch', 'Format-TodoDisplayLine', 'Format-TodoEntries',
     'Get-TodoPadding', 'Get-TodoColorMap', 'Remove-TodoBlankLines',
+    'Get-TodoSigilSet', 'Get-TodoCompletion', 'Register-TodoArgumentCompleter',
     'Add-TodoTask', 'Get-TodoTaskText', 'Get-TodoSigilWords', 'Get-TodoDate',
     'Invoke-TodoAdd', 'Invoke-TodoAddMultiple', 'Invoke-TodoAddTo', 'Invoke-TodoAppend',
     'Invoke-TodoArchive', 'Invoke-TodoDeduplicate', 'Invoke-TodoDelete', 'Invoke-TodoDeprioritize',
-    'Invoke-TodoDone', 'Invoke-TodoStart', 'Invoke-TodoList', 'Invoke-TodoListAll', 'Invoke-TodoListPriority',
+    'Invoke-TodoDone', 'Invoke-TodoStart', 'Invoke-TodoAgenda', 'Invoke-TodoList', 'Invoke-TodoListAll', 'Invoke-TodoListPriority',
     'Invoke-TodoListAddons', 'Invoke-TodoMove', 'Invoke-TodoPrioritize', 'Invoke-TodoReplaceOrPrepend',
     'Invoke-TodoReport', 'Invoke-TodoAction', 'ConvertFrom-TodoArgument',
     'Get-TodoUsage', 'Get-TodoShortHelp', 'Get-TodoHelp', 'Get-TodoVersion',

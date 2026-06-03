@@ -1,0 +1,46 @@
+name: publish
+
+# Publishes the module to the PowerShell Gallery when a version tag (vX.Y.Z) is
+# pushed. Dormant by default: the publish step is skipped unless the
+# PSGALLERY_API_KEY repository secret is configured. The tag should match the
+# ModuleVersion in src/TodoTxt.psd1.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish to PowerShell Gallery
+    runs-on: ubuntu-latest
+    # Surfaced as a job-level env var so the step `if:` conditions can read it
+    # (GitHub does not allow `secrets` directly in `if`).
+    env:
+      PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -MinimumVersion 5.0.0 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run tests
+        shell: pwsh
+        run: pwsh -File tests/Invoke-Tests.ps1 -CI
+
+      - name: Publish module
+        if: ${{ env.PSGALLERY_API_KEY != '' }}
+        shell: pwsh
+        run: |
+          # Publish-Module requires the module folder to be named after the
+          # module (TodoTxt), so stage src/ into a correctly-named directory.
+          $staging = Join-Path $env:RUNNER_TEMP 'TodoTxt'
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item ./src/* $staging -Recurse -Force
+          Publish-Module -Path $staging -NuGetApiKey $env:PSGALLERY_API_KEY -Verbose
+
+      - name: Note when unconfigured
+        if: ${{ env.PSGALLERY_API_KEY == '' }}
+        shell: pwsh
+        run: Write-Host 'PSGALLERY_API_KEY secret is not set; skipping publish.'

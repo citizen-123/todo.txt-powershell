@@ -65,7 +65,9 @@ function Add-TodoProfileFunction {
     #>
     param(
         [Parameter(Mandatory)][string]$ProfilePath,
-        [Parameter(Mandatory)][string]$WrapperPath
+        [Parameter(Mandatory)][string]$WrapperPath,
+        [string]$ModulePath,
+        [switch]$Completion
     )
     $start = '# >>> todo-cli >>>'
     $end = '# <<< todo-cli <<<'
@@ -90,7 +92,14 @@ function Add-TodoProfileFunction {
 
     if ($kept.Count -gt 0) { $kept.Add('') }
     $kept.Add($start)
-    $kept.Add("function todo { & `"$WrapperPath`" @args }")
+    # A ValueFromRemainingArguments parameter (rather than $args) lets the tab
+    # completer hook the command's argument values.
+    $kept.Add("function todo { param([Parameter(ValueFromRemainingArguments)][string[]]`$TodoArgs) & `"$WrapperPath`" @TodoArgs }")
+    if ($Completion -and $ModulePath) {
+        # Import the module and register the tab-completer for the todo command.
+        $kept.Add("Import-Module `"$ModulePath`"")
+        $kept.Add('Register-TodoArgumentCompleter -CommandName todo')
+    }
     $kept.Add($end)
 
     Set-Content -LiteralPath $ProfilePath -Value $kept -Encoding utf8
@@ -187,7 +196,8 @@ function Invoke-TodoInstaller {
     New-Item -ItemType Directory -Force -Path $TodoDir | Out-Null
 
     # Gather options.
-    $git = $false; $remote = ''; $inProgress = $false; $dateTags = $false; $registerAlias = $true
+    $git = $false; $remote = ''; $inProgress = $false; $dateTags = $false
+    $registerAlias = $true; $completion = $true
     if (-not $useDefaults) {
         $git = Read-YesNo -Prompt 'Track your todo directory with git?' -DefaultYes:$false
         if ($git) {
@@ -200,6 +210,9 @@ function Invoke-TodoInstaller {
         $inProgress = Read-YesNo -Prompt 'Enable in-progress tracking (start/ip + started: tag)?' -DefaultYes:$false
         $dateTags = Read-YesNo -Prompt 'Tag tasks with added:/completed: dates?' -DefaultYes:$false
         $registerAlias = Read-YesNo -Prompt 'Register a `todo` command in your PowerShell profile?' -DefaultYes:$true
+        if ($registerAlias) {
+            $completion = Read-YesNo -Prompt 'Enable tab completion for actions/projects/contexts?' -DefaultYes:$true
+        }
     }
 
     # Write the config file at the first search location ($HOME/.todo/config).
@@ -221,8 +234,9 @@ function Invoke-TodoInstaller {
 
     if ($registerAlias) {
         $wrapper = Join-Path $InstallDir 'todo.ps1'
-        Add-TodoProfileFunction -ProfilePath $PROFILE -WrapperPath $wrapper
-        Write-Host "Registered 'todo' function in $PROFILE"
+        $modulePath = Join-Path $InstallDir 'src' 'TodoTxt.psd1'
+        Add-TodoProfileFunction -ProfilePath $PROFILE -WrapperPath $wrapper -ModulePath $modulePath -Completion:$completion
+        Write-Host "Registered 'todo' function in $PROFILE$(if ($completion) { ' (with tab completion)' })"
     }
 
     Write-Host ''

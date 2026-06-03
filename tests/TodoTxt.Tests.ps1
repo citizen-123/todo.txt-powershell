@@ -592,6 +592,16 @@ Describe 'Action: in-progress (start) + lifecycle date tags' {
         $out[0] | Should -Match 'i \(A\) alpha'
         $out[1] | Should -Match '\(B\) bravo'
     }
+    It 'completed (x) tasks sort by the x-marker lexically, like todo.sh' {
+        Invoke-T $d @('add', 'bbb stay pending') | Out-Null
+        Invoke-T $d @('add', 'aaa complete me') | Out-Null
+        Invoke-T $d @('-a', 'do', '2') | Out-Null   # x ... aaa, stays in todo.txt
+        $out = Invoke-T $d @('lsa') | Where-Object { $_ -notmatch '^(--|TODO:|DONE:|total)' }
+        # 'x ' (0x78) sorts after 'b', so the done task is keyed by its marker and
+        # lands last here -- NOT by 'aaa', which the old skip-all behaviour did.
+        $out[0]  | Should -Match 'bbb stay pending'
+        $out[-1] | Should -Match 'x .*aaa complete me'
+    }
 }
 
 Describe 'Action: start requires the feature toggle' {
@@ -722,5 +732,184 @@ Describe 'Git tracking: unavailable git' {
         Invoke-T $d @('add', 'task') 2>$null | Out-Null
         (Get-TodoLines $d) | Should -Be @('task')
         Get-TodoExitCode | Should -Be 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Unit: key:value tag helpers' {
+    It 'Get-TodoTag reads a tag value, else null' {
+        Get-TodoTag -Line 'buy milk due:2026-06-03 +shop' -Key 'due' | Should -Be '2026-06-03'
+        Get-TodoTag -Line 'no tags here' -Key 'due' | Should -BeNullOrEmpty
+    }
+    It 'Get-TodoTag matches whole keys only' {
+        # "predue:..." must not match key "due"
+        Get-TodoTag -Line 'x predue:2026-01-01' -Key 'due' | Should -BeNullOrEmpty
+    }
+    It 'Set-TodoTag replaces in place' {
+        Set-TodoTag -Line 'task due:2026-01-01 +p' -Key 'due' -Value '2026-02-02' |
+            Should -Be 'task due:2026-02-02 +p'
+    }
+    It 'Set-TodoTag appends when absent' {
+        Set-TodoTag -Line 'task +p' -Key 'due' -Value '2026-02-02' | Should -Be 'task +p due:2026-02-02'
+    }
+    It 'ConvertTo-TodoDate parses or returns null' {
+        (ConvertTo-TodoDate '2026-06-03').Year | Should -Be 2026
+        ConvertTo-TodoDate 'notadate' | Should -BeNullOrEmpty
+        ConvertTo-TodoDate '' | Should -BeNullOrEmpty
+    }
+    It 'Add-TodoDateInterval advances by d/w/m/y (and accepts +)' {
+        $base = [datetime]'2026-01-01'
+        (Add-TodoDateInterval -Date $base -Interval '3d').ToString('yyyy-MM-dd') | Should -Be '2026-01-04'
+        (Add-TodoDateInterval -Date $base -Interval '2w').ToString('yyyy-MM-dd') | Should -Be '2026-01-15'
+        (Add-TodoDateInterval -Date $base -Interval '1m').ToString('yyyy-MM-dd') | Should -Be '2026-02-01'
+        (Add-TodoDateInterval -Date $base -Interval '+1y').ToString('yyyy-MM-dd') | Should -Be '2027-01-01'
+    }
+    It 'Add-TodoDateInterval throws on garbage' {
+        { Add-TodoDateInterval -Date ([datetime]'2026-01-01') -Interval 'xyz' } | Should -Throw
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Action: agenda / due' {
+    BeforeEach {
+        $script:d = New-TestDir
+        Mock -ModuleName TodoTxt Get-TodoDate { '2026-06-15' }
+    }
+    AfterEach { Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'shows overdue and today by default, excludes future and un-dated' {
+        Invoke-T $d @('add', 'overdue due:2026-06-10') | Out-Null
+        Invoke-T $d @('add', 'today due:2026-06-15') | Out-Null
+        Invoke-T $d @('add', 'soon due:2026-06-18') | Out-Null
+        Invoke-T $d @('add', 'no due date') | Out-Null
+        $out = Invoke-T $d @('agenda') | Where-Object { $_ -notmatch '^(--|TODO:)' }
+        ($out -join "`n") | Should -Match 'overdue'
+        ($out -join "`n") | Should -Match 'today'
+        ($out -join "`n") | Should -Not -Match 'soon'
+        ($out -join "`n") | Should -Not -Match 'no due date'
+    }
+    It 'widens the window with a numeric horizon and sorts by due date' {
+        Invoke-T $d @('add', 'soon due:2026-06-18') | Out-Null
+        Invoke-T $d @('add', 'overdue due:2026-06-10') | Out-Null
+        Invoke-T $d @('add', 'far due:2026-07-30') | Out-Null
+        $out = Invoke-T $d @('due', '7') | Where-Object { $_ -notmatch '^(--|TODO:)' }
+        $out[0] | Should -Match 'overdue'   # earliest due first
+        $out[1] | Should -Match 'soon'
+        ($out -join "`n") | Should -Not -Match 'far'
+    }
+    It 'excludes done tasks and applies filter terms' {
+        # NOTE: terms are .NET regex (tool-wide), so we filter on a plain word.
+        Invoke-T $d @('add', 'pay bills +home due:2026-06-10') | Out-Null
+        Invoke-T $d @('add', 'call boss +work due:2026-06-10') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        $out = Invoke-T $d @('agenda', 'work') | Where-Object { $_ -notmatch '^(--|TODO:)' }
+        ($out -join "`n") | Should -Match 'call boss'
+        ($out -join "`n") | Should -Not -Match 'pay bills'
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Threshold (t:) hiding' {
+    BeforeEach {
+        $script:d = New-TestDir
+        Mock -ModuleName TodoTxt Get-TodoDate { '2026-06-15' }
+    }
+    AfterEach {
+        Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\TODOTXT_HIDE_FUTURE_TASKS -ErrorAction SilentlyContinue
+    }
+
+    It 'hides future-threshold tasks when enabled, keeps past/absent' {
+        Invoke-T $d @('add', 'future t:2026-06-20') | Out-Null
+        Invoke-T $d @('add', 'ready t:2026-06-10') | Out-Null
+        Invoke-T $d @('add', 'plain task') | Out-Null
+        $env:TODOTXT_HIDE_FUTURE_TASKS = '1'
+        $out = Invoke-T $d @('ls') | Where-Object { $_ -notmatch '^(--|TODO:)' }
+        ($out -join "`n") | Should -Not -Match 'future'
+        ($out -join "`n") | Should -Match 'ready'
+        ($out -join "`n") | Should -Match 'plain task'
+    }
+    It 'shows everything when disabled (default)' {
+        Invoke-T $d @('add', 'future t:2026-06-20') | Out-Null
+        $out = Invoke-T $d @('ls') | Where-Object { $_ -notmatch '^(--|TODO:)' }
+        ($out -join "`n") | Should -Match 'future'
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Recurrence (rec:) respawn on do' {
+    BeforeEach {
+        $script:d = New-TestDir
+        $env:TODOTXT_RECURRENCE = '1'
+        Mock -ModuleName TodoTxt Get-TodoDate { '2026-06-15' }
+    }
+    AfterEach {
+        Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\TODOTXT_RECURRENCE -ErrorAction SilentlyContinue
+    }
+
+    It 'non-strict: advances due from today and keeps priority' {
+        Invoke-T $d @('add', '(A) water plants rec:1w due:2026-06-01') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        $pending = (Get-TodoLines $d) | Where-Object { $_ -notmatch '^x ' }
+        $pending | Should -Be '(A) water plants rec:1w due:2026-06-22'   # 2026-06-15 + 1w
+    }
+    It 'strict (+): advances due from the old due date; t keeps its lead time' {
+        Invoke-T $d @('add', 'pay rent rec:+1m due:2026-06-01 t:2026-05-27') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        $pending = (Get-TodoLines $d) | Where-Object { $_ -notmatch '^x ' }
+        $pending | Should -Match 'due:2026-07-01'   # 2026-06-01 + 1m
+        $pending | Should -Match 't:2026-06-26'      # lead time (30d offset) preserved
+    }
+    It 'drops started:/completed: from the respawn' {
+        Invoke-T $d @('add', 'jog rec:1d due:2026-06-10 started:2026-06-09') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        $pending = (Get-TodoLines $d) | Where-Object { $_ -notmatch '^x ' }
+        $pending | Should -Not -Match 'started:'
+        $pending | Should -Not -Match 'completed:'
+    }
+    It 'malformed rec: completes the task without respawning' {
+        Invoke-T $d @('add', 'broken rec:xyz due:2026-06-10') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') 2>$null | Out-Null
+        (Get-TodoLines $d) | Where-Object { $_ -notmatch '^x ' } | Should -BeNullOrEmpty
+    }
+    It 'no respawn when recurrence is disabled' {
+        Remove-Item Env:\TODOTXT_RECURRENCE
+        Invoke-T $d @('add', 'norec rec:1d due:2026-06-10') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        (Get-TodoLines $d) | Where-Object { $_ -notmatch '^x ' } | Should -BeNullOrEmpty
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Tab completion logic' {
+    BeforeEach {
+        $script:d = New-TestDir
+        Invoke-T $d @('add', 'buy milk +groceries +garden @store @home') | Out-Null
+        $script:cfg = New-TodoConfig -TodoDir $script:d
+    }
+    AfterEach { Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'Get-TodoSigilSet returns distinct sorted sigil tokens' {
+        Get-TodoSigilSet -Config $cfg -Sigil '+' | Should -Be @('+garden', '+groceries')
+        Get-TodoSigilSet -Config $cfg -Sigil '@' | Should -Be @('@home', '@store')
+    }
+    It 'completes action names at the first position' {
+        $r = Get-TodoCompletion -Config $cfg -WordToComplete 'ls' -CommandElements @('todo', 'ls')
+        $r | Should -Contain 'ls'
+        $r | Should -Contain 'lsa'
+        $r | Should -Not -Contain 'add'
+    }
+    It 'completes +projects filtered by prefix' {
+        $r = Get-TodoCompletion -Config $cfg -WordToComplete '+g' -CommandElements @('todo', 'add', '+g')
+        $r | Should -Be @('+garden', '+groceries')
+    }
+    It 'completes @contexts filtered by prefix' {
+        Get-TodoCompletion -Config $cfg -WordToComplete '@s' -CommandElements @('todo', 'ls', '@s') |
+            Should -Be @('@store')
+    }
+    It 'offers nothing for a plain argument that is not an action position' {
+        Get-TodoCompletion -Config $cfg -WordToComplete 'mi' -CommandElements @('todo', 'add', 'mi') |
+            Should -BeNullOrEmpty
     }
 }
