@@ -120,7 +120,7 @@ Describe 'Unit: Test-TodoMatch (search filtering)' {
 
 # ----------------------------------------------------------------------------
 Describe 'Unit: Format-TodoDisplayLine' {
-    BeforeAll { $cfg = New-TodoConfig -TodoDir (Join-Path ([System.IO.Path]::GetTempPath()) 'fmt') -Overrides @{ Plain = $true } }
+    BeforeAll { $script:cfg = New-TodoConfig -TodoDir (Join-Path ([System.IO.Path]::GetTempPath()) 'fmt') -Overrides @{ Plain = $true } }
 
     It 'zero-pads the number to the requested width' {
         Format-TodoDisplayLine -Config $cfg -Num 3 -Text 'task' -Width 2 | Should -Be '03 task'
@@ -493,5 +493,420 @@ Describe 'Action: addon execution' {
             Invoke-T $d @('listaddons') | Should -Contain 'foo.ps1'
         }
         finally { Remove-Item Env:\TODO_ACTIONS_DIR -ErrorAction SilentlyContinue }
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Unit: Split-TodoMarker (status markers)' {
+    It 'splits a done marker' {
+        $m = Split-TodoMarker 'x 2020-01-01 done'
+        $m.Marker | Should -Be 'x '
+        $m.Rest   | Should -Be '2020-01-01 done'
+    }
+    It 'splits an in-progress marker' {
+        $m = Split-TodoMarker 'i (A) task started:2020-01-01'
+        $m.Marker | Should -Be 'i '
+        $m.Rest   | Should -Be '(A) task started:2020-01-01'
+    }
+    It 'leaves a bare task untouched' {
+        $m = Split-TodoMarker 'plain task'
+        $m.Marker | Should -Be ''
+        $m.Rest   | Should -Be 'plain task'
+    }
+    It 'does not treat an arbitrary leading letter as a marker' {
+        (Split-TodoMarker 'a quick note').Marker | Should -Be ''
+    }
+    It 'Get-TodoPriority sees through a marker' {
+        Get-TodoPriority 'i (A) task' | Should -Be 'A'
+    }
+    It 'Split-TodoPrefix exposes marker, priority and date' {
+        $p = Split-TodoPrefix 'i (A) 2020-01-02 task'
+        $p.Marker   | Should -Be 'i '
+        $p.Priority | Should -Be '(A) '
+        $p.Date     | Should -Be '2020-01-02 '
+        $p.Rest     | Should -Be 'task'
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Action: in-progress (start) + lifecycle date tags' {
+    BeforeEach {
+        $script:d = New-TestDir
+        $env:TODOTXT_IN_PROGRESS = '1'
+        $env:TODOTXT_DATE_TAGS = '1'
+        Mock -ModuleName TodoTxt Get-TodoDate { '2020-01-15' }
+    }
+    AfterEach {
+        Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\TODOTXT_IN_PROGRESS, Env:\TODOTXT_DATE_TAGS -ErrorAction SilentlyContinue
+    }
+
+    It 'add appends an added: tag when date tags are on' {
+        Invoke-T $d @('add', 'buy milk') | Out-Null
+        (Get-TodoLines $d)[0] | Should -Be 'buy milk added:2020-01-15'
+    }
+    It 'start prepends i and a started: tag, preserving priority' {
+        Invoke-T $d @('add', '(A) write report') | Out-Null
+        Invoke-T $d @('start', '1') | Out-Null
+        (Get-TodoLines $d)[0] | Should -Be 'i (A) write report added:2020-01-15 started:2020-01-15'
+    }
+    It 'start on an already in-progress task sets exit code 1' {
+        Invoke-T $d @('add', 'task') | Out-Null
+        Invoke-T $d @('start', '1') | Out-Null
+        Invoke-T $d @('start', '1') 2>$null | Out-Null
+        Get-TodoExitCode | Should -Be 1
+    }
+    It 'do on an in-progress task drops i + priority, keeps started, adds completed' {
+        Invoke-T $d @('add', '(A) write report') | Out-Null
+        Invoke-T $d @('start', '1') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        (Get-TodoLines $d)[0] | Should -Be 'x 2020-01-15 write report added:2020-01-15 started:2020-01-15 completed:2020-01-15'
+    }
+    It 'pri changes priority while keeping the in-progress marker' {
+        Invoke-T $d @('add', '(A) task') | Out-Null
+        Invoke-T $d @('start', '1') | Out-Null
+        Invoke-T $d @('pri', '1', 'C') | Out-Null
+        (Get-TodoLines $d)[0] | Should -Match '^i \(C\) task'
+    }
+    It 'depri removes priority while keeping the in-progress marker' {
+        Invoke-T $d @('add', '(A) task') | Out-Null
+        Invoke-T $d @('start', '1') | Out-Null
+        Invoke-T $d @('depri', '1') | Out-Null
+        (Get-TodoLines $d)[0] | Should -Match '^i task'
+    }
+    It 'archive keeps in-progress tasks but moves done tasks' {
+        Invoke-T $d @('add', 'one') | Out-Null
+        Invoke-T $d @('add', 'two') | Out-Null
+        Invoke-T $d @('start', '1') | Out-Null
+        Invoke-T $d @('-a', 'do', '2') | Out-Null   # mark done without auto-archiving
+        Invoke-T $d @('archive') | Out-Null         # explicit archive
+        (Get-TodoLines $d) | Should -HaveCount 1
+        (Get-TodoLines $d)[0] | Should -Match '^i one'
+        (Get-DoneLines $d)[0] | Should -Match '^x 2020-01-15 two'
+    }
+    It 'in-progress task sorts by its underlying priority' {
+        Invoke-T $d @('add', '(A) alpha') | Out-Null
+        Invoke-T $d @('add', '(B) bravo') | Out-Null
+        Invoke-T $d @('start', '1') | Out-Null   # i (A) alpha -> still sorts first
+        $out = Invoke-T $d @('ls')
+        $out[0] | Should -Match 'i \(A\) alpha'
+        $out[1] | Should -Match '\(B\) bravo'
+    }
+    It 'completed (x) tasks sort by the x-marker lexically, like todo.sh' {
+        Invoke-T $d @('add', 'bbb stay pending') | Out-Null
+        Invoke-T $d @('add', 'aaa complete me') | Out-Null
+        Invoke-T $d @('-a', 'do', '2') | Out-Null   # x ... aaa, stays in todo.txt
+        $out = Invoke-T $d @('lsa') | Where-Object { $_ -notmatch '^(--|TODO:|DONE:|total)' }
+        # 'x ' (0x78) sorts after 'b', so the done task is keyed by its marker and
+        # lands last here -- NOT by 'aaa', which the old skip-all behaviour did.
+        $out[0]  | Should -Match 'bbb stay pending'
+        $out[-1] | Should -Match 'x .*aaa complete me'
+    }
+}
+
+Describe 'Action: start requires the feature toggle' {
+    BeforeEach { $script:d = New-TestDir }
+    AfterEach { Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'throws when TODOTXT_IN_PROGRESS is not enabled' {
+        Invoke-T $d @('add', 'task') | Out-Null
+        { Invoke-T $d @('start', '1') } | Should -Throw '*in-progress tracking*'
+    }
+}
+
+Describe 'Action: date tags off by default' {
+    BeforeEach { $script:d = New-TestDir; Mock -ModuleName TodoTxt Get-TodoDate { '2020-01-15' } }
+    AfterEach { Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'add does not tag when date tags are off' {
+        Invoke-T $d @('add', 'buy milk') | Out-Null
+        (Get-TodoLines $d)[0] | Should -Be 'buy milk'
+    }
+    It 'do does not add a completed: tag when date tags are off' {
+        Invoke-T $d @('add', 'buy milk') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        (Get-TodoLines $d)[0] | Should -Be 'x 2020-01-15 buy milk'
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Color: in-progress marker' {
+    It 'emits the in-progress color for an i line without priority' {
+        $c = New-TodoConfig -TodoDir 'x' -Overrides @{ Plain = $false }
+        $line = Format-TodoDisplayLine -Config $c -Num 1 -Text 'i buy milk' -Width 1
+        $line | Should -Match ([char]27)
+        $line | Should -Match ([regex]::Escape($c.Colors.COLOR_INPROGRESS))
+    }
+    It 'colors an in-progress priority task by its priority color' {
+        $c = New-TodoConfig -TodoDir 'x' -Overrides @{ Plain = $false }
+        $line = Format-TodoDisplayLine -Config $c -Num 1 -Text 'i (A) task' -Width 1
+        $line | Should -Match ([regex]::Escape($c.Colors.PRI_A))
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Action: add-ons override built-ins' {
+    BeforeEach {
+        $script:d = New-TestDir
+        $script:actions = Join-Path $script:d 'actions'
+        [void][System.IO.Directory]::CreateDirectory($script:actions)
+        $env:TODO_ACTIONS_DIR = $script:actions
+    }
+    AfterEach {
+        Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\TODO_ACTIONS_DIR -ErrorAction SilentlyContinue
+    }
+
+    It 'an add.ps1 add-on shadows the built-in add' {
+        'param() "OVERRIDE:$args"' | Set-Content -Path (Join-Path $actions 'add.ps1')
+        $out = Invoke-T $d @('add', 'hello')
+        $out | Should -Be 'OVERRIDE:hello'
+        (Get-TodoLines $d) | Should -BeNullOrEmpty   # built-in add never ran
+    }
+    It 'command <action> bypasses the override and runs the built-in' {
+        'param() "OVERRIDE"' | Set-Content -Path (Join-Path $actions 'add.ps1')
+        Invoke-T $d @('command', 'add', 'real task') | Out-Null
+        (Get-TodoLines $d) | Should -Be @('real task')
+    }
+    It 'the add-on receives a real TODO_SH wrapper path' {
+        'param() $env:TODO_SH' | Set-Content -Path (Join-Path $actions 'whereami.ps1')
+        $out = Invoke-T $d @('whereami')
+        $out | Should -Match 'todo\.ps1$'
+        Test-Path $out | Should -BeTrue
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Git tracking (mocked git)' {
+    BeforeEach {
+        $script:d = New-TestDir
+        $env:TODOTXT_GIT = '1'
+        Mock -ModuleName TodoTxt Test-TodoGitAvailable { $true }
+        Mock -ModuleName TodoTxt Test-TodoGitRepo { $true }
+        Mock -ModuleName TodoTxt Invoke-TodoGitCommand { [pscustomobject]@{ ExitCode = 0; Output = '' } }
+    }
+    AfterEach {
+        Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\TODOTXT_GIT, Env:\TODOTXT_GIT_REMOTE -ErrorAction SilentlyContinue
+    }
+
+    It 'commits after a mutating action' {
+        Invoke-T $d @('add', 'task') | Out-Null
+        Should -Invoke -ModuleName TodoTxt Invoke-TodoGitCommand -ParameterFilter { $GitArgs[0] -eq 'add' }
+        Should -Invoke -ModuleName TodoTxt Invoke-TodoGitCommand -ParameterFilter { $GitArgs[0] -eq 'commit' }
+    }
+    It 'does not run git for a read-only action' {
+        Invoke-T $d @('add', 'task') | Out-Null   # one commit from the add
+        Invoke-T $d @('ls') | Out-Null            # read-only: must not commit
+        Should -Invoke -ModuleName TodoTxt Invoke-TodoGitCommand -ParameterFilter { $GitArgs[0] -eq 'commit' } -Times 1 -Exactly
+    }
+    It 'pushes when a remote is configured' {
+        $env:TODOTXT_GIT_REMOTE = 'git@example.com:me/todo.git'
+        Invoke-T $d @('add', 'task') | Out-Null
+        Should -Invoke -ModuleName TodoTxt Invoke-TodoGitCommand -ParameterFilter { $GitArgs[0] -eq 'push' }
+    }
+    It 'auto-initializes the repo when missing (and adds the remote)' {
+        $env:TODOTXT_GIT_REMOTE = 'git@example.com:me/todo.git'
+        Mock -ModuleName TodoTxt Test-TodoGitRepo { $false }
+        Invoke-T $d @('add', 'task') | Out-Null
+        Should -Invoke -ModuleName TodoTxt Invoke-TodoGitCommand -ParameterFilter { $GitArgs[0] -eq 'init' }
+        Should -Invoke -ModuleName TodoTxt Invoke-TodoGitCommand -ParameterFilter { $GitArgs[0] -eq 'remote' -and $GitArgs[1] -eq 'add' }
+    }
+}
+
+Describe 'Git tracking: unavailable git' {
+    BeforeEach {
+        $script:d = New-TestDir
+        $env:TODOTXT_GIT = '1'
+        Mock -ModuleName TodoTxt Test-TodoGitAvailable { $false }
+    }
+    AfterEach {
+        Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\TODOTXT_GIT -ErrorAction SilentlyContinue
+    }
+
+    It 'still writes the task, warns, and sets exit code 1' {
+        Invoke-T $d @('add', 'task') 2>$null | Out-Null
+        (Get-TodoLines $d) | Should -Be @('task')
+        Get-TodoExitCode | Should -Be 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Unit: key:value tag helpers' {
+    It 'Get-TodoTag reads a tag value, else null' {
+        Get-TodoTag -Line 'buy milk due:2026-06-03 +shop' -Key 'due' | Should -Be '2026-06-03'
+        Get-TodoTag -Line 'no tags here' -Key 'due' | Should -BeNullOrEmpty
+    }
+    It 'Get-TodoTag matches whole keys only' {
+        # "predue:..." must not match key "due"
+        Get-TodoTag -Line 'x predue:2026-01-01' -Key 'due' | Should -BeNullOrEmpty
+    }
+    It 'Set-TodoTag replaces in place' {
+        Set-TodoTag -Line 'task due:2026-01-01 +p' -Key 'due' -Value '2026-02-02' |
+            Should -Be 'task due:2026-02-02 +p'
+    }
+    It 'Set-TodoTag appends when absent' {
+        Set-TodoTag -Line 'task +p' -Key 'due' -Value '2026-02-02' | Should -Be 'task +p due:2026-02-02'
+    }
+    It 'ConvertTo-TodoDate parses or returns null' {
+        (ConvertTo-TodoDate '2026-06-03').Year | Should -Be 2026
+        ConvertTo-TodoDate 'notadate' | Should -BeNullOrEmpty
+        ConvertTo-TodoDate '' | Should -BeNullOrEmpty
+    }
+    It 'Add-TodoDateInterval advances by d/w/m/y (and accepts +)' {
+        $base = [datetime]'2026-01-01'
+        (Add-TodoDateInterval -Date $base -Interval '3d').ToString('yyyy-MM-dd') | Should -Be '2026-01-04'
+        (Add-TodoDateInterval -Date $base -Interval '2w').ToString('yyyy-MM-dd') | Should -Be '2026-01-15'
+        (Add-TodoDateInterval -Date $base -Interval '1m').ToString('yyyy-MM-dd') | Should -Be '2026-02-01'
+        (Add-TodoDateInterval -Date $base -Interval '+1y').ToString('yyyy-MM-dd') | Should -Be '2027-01-01'
+    }
+    It 'Add-TodoDateInterval throws on garbage' {
+        { Add-TodoDateInterval -Date ([datetime]'2026-01-01') -Interval 'xyz' } | Should -Throw
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Action: agenda / due' {
+    BeforeEach {
+        $script:d = New-TestDir
+        Mock -ModuleName TodoTxt Get-TodoDate { '2026-06-15' }
+    }
+    AfterEach { Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'shows overdue and today by default, excludes future and un-dated' {
+        Invoke-T $d @('add', 'overdue due:2026-06-10') | Out-Null
+        Invoke-T $d @('add', 'today due:2026-06-15') | Out-Null
+        Invoke-T $d @('add', 'soon due:2026-06-18') | Out-Null
+        Invoke-T $d @('add', 'no due date') | Out-Null
+        $out = Invoke-T $d @('agenda') | Where-Object { $_ -notmatch '^(--|TODO:)' }
+        ($out -join "`n") | Should -Match 'overdue'
+        ($out -join "`n") | Should -Match 'today'
+        ($out -join "`n") | Should -Not -Match 'soon'
+        ($out -join "`n") | Should -Not -Match 'no due date'
+    }
+    It 'widens the window with a numeric horizon and sorts by due date' {
+        Invoke-T $d @('add', 'soon due:2026-06-18') | Out-Null
+        Invoke-T $d @('add', 'overdue due:2026-06-10') | Out-Null
+        Invoke-T $d @('add', 'far due:2026-07-30') | Out-Null
+        $out = Invoke-T $d @('due', '7') | Where-Object { $_ -notmatch '^(--|TODO:)' }
+        $out[0] | Should -Match 'overdue'   # earliest due first
+        $out[1] | Should -Match 'soon'
+        ($out -join "`n") | Should -Not -Match 'far'
+    }
+    It 'excludes done tasks and applies filter terms' {
+        # NOTE: terms are .NET regex (tool-wide), so we filter on a plain word.
+        Invoke-T $d @('add', 'pay bills +home due:2026-06-10') | Out-Null
+        Invoke-T $d @('add', 'call boss +work due:2026-06-10') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        $out = Invoke-T $d @('agenda', 'work') | Where-Object { $_ -notmatch '^(--|TODO:)' }
+        ($out -join "`n") | Should -Match 'call boss'
+        ($out -join "`n") | Should -Not -Match 'pay bills'
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Threshold (t:) hiding' {
+    BeforeEach {
+        $script:d = New-TestDir
+        Mock -ModuleName TodoTxt Get-TodoDate { '2026-06-15' }
+    }
+    AfterEach {
+        Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\TODOTXT_HIDE_FUTURE_TASKS -ErrorAction SilentlyContinue
+    }
+
+    It 'hides future-threshold tasks when enabled, keeps past/absent' {
+        Invoke-T $d @('add', 'future t:2026-06-20') | Out-Null
+        Invoke-T $d @('add', 'ready t:2026-06-10') | Out-Null
+        Invoke-T $d @('add', 'plain task') | Out-Null
+        $env:TODOTXT_HIDE_FUTURE_TASKS = '1'
+        $out = Invoke-T $d @('ls') | Where-Object { $_ -notmatch '^(--|TODO:)' }
+        ($out -join "`n") | Should -Not -Match 'future'
+        ($out -join "`n") | Should -Match 'ready'
+        ($out -join "`n") | Should -Match 'plain task'
+    }
+    It 'shows everything when disabled (default)' {
+        Invoke-T $d @('add', 'future t:2026-06-20') | Out-Null
+        $out = Invoke-T $d @('ls') | Where-Object { $_ -notmatch '^(--|TODO:)' }
+        ($out -join "`n") | Should -Match 'future'
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Recurrence (rec:) respawn on do' {
+    BeforeEach {
+        $script:d = New-TestDir
+        $env:TODOTXT_RECURRENCE = '1'
+        Mock -ModuleName TodoTxt Get-TodoDate { '2026-06-15' }
+    }
+    AfterEach {
+        Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\TODOTXT_RECURRENCE -ErrorAction SilentlyContinue
+    }
+
+    It 'non-strict: advances due from today and keeps priority' {
+        Invoke-T $d @('add', '(A) water plants rec:1w due:2026-06-01') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        $pending = (Get-TodoLines $d) | Where-Object { $_ -notmatch '^x ' }
+        $pending | Should -Be '(A) water plants rec:1w due:2026-06-22'   # 2026-06-15 + 1w
+    }
+    It 'strict (+): advances due from the old due date; t keeps its lead time' {
+        Invoke-T $d @('add', 'pay rent rec:+1m due:2026-06-01 t:2026-05-27') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        $pending = (Get-TodoLines $d) | Where-Object { $_ -notmatch '^x ' }
+        $pending | Should -Match 'due:2026-07-01'   # 2026-06-01 + 1m
+        $pending | Should -Match 't:2026-06-26'      # lead time (30d offset) preserved
+    }
+    It 'drops started:/completed: from the respawn' {
+        Invoke-T $d @('add', 'jog rec:1d due:2026-06-10 started:2026-06-09') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        $pending = (Get-TodoLines $d) | Where-Object { $_ -notmatch '^x ' }
+        $pending | Should -Not -Match 'started:'
+        $pending | Should -Not -Match 'completed:'
+    }
+    It 'malformed rec: completes the task without respawning' {
+        Invoke-T $d @('add', 'broken rec:xyz due:2026-06-10') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') 2>$null | Out-Null
+        (Get-TodoLines $d) | Where-Object { $_ -notmatch '^x ' } | Should -BeNullOrEmpty
+    }
+    It 'no respawn when recurrence is disabled' {
+        Remove-Item Env:\TODOTXT_RECURRENCE
+        Invoke-T $d @('add', 'norec rec:1d due:2026-06-10') | Out-Null
+        Invoke-T $d @('-a', 'do', '1') | Out-Null
+        (Get-TodoLines $d) | Where-Object { $_ -notmatch '^x ' } | Should -BeNullOrEmpty
+    }
+}
+
+# ----------------------------------------------------------------------------
+Describe 'Tab completion logic' {
+    BeforeEach {
+        $script:d = New-TestDir
+        Invoke-T $d @('add', 'buy milk +groceries +garden @store @home') | Out-Null
+        $script:cfg = New-TodoConfig -TodoDir $script:d
+    }
+    AfterEach { Remove-Item $script:d -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'Get-TodoSigilSet returns distinct sorted sigil tokens' {
+        Get-TodoSigilSet -Config $cfg -Sigil '+' | Should -Be @('+garden', '+groceries')
+        Get-TodoSigilSet -Config $cfg -Sigil '@' | Should -Be @('@home', '@store')
+    }
+    It 'completes action names at the first position' {
+        $r = Get-TodoCompletion -Config $cfg -WordToComplete 'ls' -CommandElements @('todo', 'ls')
+        $r | Should -Contain 'ls'
+        $r | Should -Contain 'lsa'
+        $r | Should -Not -Contain 'add'
+    }
+    It 'completes +projects filtered by prefix' {
+        $r = Get-TodoCompletion -Config $cfg -WordToComplete '+g' -CommandElements @('todo', 'add', '+g')
+        $r | Should -Be @('+garden', '+groceries')
+    }
+    It 'completes @contexts filtered by prefix' {
+        Get-TodoCompletion -Config $cfg -WordToComplete '@s' -CommandElements @('todo', 'ls', '@s') |
+            Should -Be @('@store')
+    }
+    It 'offers nothing for a plain argument that is not an action position' {
+        Get-TodoCompletion -Config $cfg -WordToComplete 'mi' -CommandElements @('todo', 'add', 'mi') |
+            Should -BeNullOrEmpty
     }
 }

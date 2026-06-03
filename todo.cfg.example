@@ -21,12 +21,23 @@ export TODOTXT_VERBOSE=1                  # 0 = quiet, 1 = normal, 2 = debug
 # export TODOTXT_PRIORITY_ON_ADD=A        # default priority for new tasks
 # export TODOTXT_DEFAULT_ACTION=ls        # action when run with no arguments
 
+# --- Extensions (PowerShell port) -------------------------------------------
+export TODOTXT_DATE_TAGS=0               # tag tasks with added:/completed: dates
+export TODOTXT_IN_PROGRESS=0             # enable the start|ip action + started: tag
+export TODOTXT_RECURRENCE=0              # respawn rec:-tagged tasks when completed
+export TODOTXT_HIDE_FUTURE_TASKS=0       # hide tasks whose t: date is in the future
+
+# --- Git tracking of the todo directory -------------------------------------
+export TODOTXT_GIT=0                     # commit (and push) after each change
+# export TODOTXT_GIT_REMOTE="git@github.com:you/todo.git"  # push target
+
 # --- Colors (ANSI). Comment out for defaults. -------------------------------
 export PRI_A=$YELLOW
 export PRI_B=$GREEN
 export PRI_C=$LIGHT_BLUE
 export PRI_X=$WHITE
 export COLOR_DONE=$LIGHT_GREY
+# export COLOR_INPROGRESS=$LIGHT_CYAN     # color for in-progress (i) tasks
 export COLOR_PROJECT=$NONE
 export COLOR_CONTEXT=$NONE
 export COLOR_DATE=$NONE

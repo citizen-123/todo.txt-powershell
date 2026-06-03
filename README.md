@@ -12,12 +12,52 @@ instead of slower pure-PowerShell idioms.
 
 * Cross-platform: PowerShell 7+ on Linux, macOS and Windows.
 * No external dependencies at runtime.
-* A full [Pester](https://pester.dev) 5 test suite (73 tests).
+* Optional extras: in-progress tracking, lifecycle date tags, and git syncing.
+* A full [Pester](https://pester.dev) 5 test suite (130 tests).
 
 ## Requirements
 
 * [PowerShell 7.0+](https://learn.microsoft.com/powershell/) (`pwsh`)
 * [Pester 5+](https://pester.dev) — for running the tests only.
+
+## Install
+
+The interactive installer fetches the project, creates your todo directory,
+writes a config file, and (optionally) registers a `todo` command in your
+PowerShell profile:
+
+```powershell
+# Interactive
+iwr https://raw.githubusercontent.com/citizen-123/todo.txt-powershell/main/install.ps1 | iex
+
+# Non-interactive (accept defaults). A piped script can't take parameters, so
+# set the env var first:
+$env:TODO_INSTALL_DEFAULT = '1'; iwr <url> | iex
+
+# Or pass flags via a script block:
+& ([scriptblock]::Create((iwr <url>).Content)) -Default
+```
+
+Local checkout: `./install.ps1` (interactive) or `./install.ps1 -Default`.
+Useful flags: `-InstallDir`, `-TodoDir`, `-Force`. The installer prompts for git
+tracking, in-progress tracking, date tags, the profile alias, and tab
+completion; `-Default` skips the prompts (git/in-progress/date-tags off, alias
+and completion registered).
+
+### Tab completion
+
+The installer can register a tab-completer that completes action names, and
+`+project` / `@context` tokens drawn from your live `todo.txt`. To enable it
+manually, add this to your PowerShell profile:
+
+```powershell
+Import-Module /path/to/todo.txt-powershell/src/TodoTxt.psd1
+Register-TodoArgumentCompleter -CommandName todo
+```
+
+The completed command (`todo`) must expose its arguments via a
+`ValueFromRemainingArguments` parameter named `TodoArgs` (the installer's
+generated function does this); `Invoke-Todo` is also completed automatically.
 
 ## Quick start
 
@@ -51,6 +91,7 @@ Set-Alias todo (Resolve-Path ./todo.ps1)
 
 ```
 add|a "THING I NEED TO DO +project @context"
+agenda|due [N] [TERM...]
 addm "MULTIPLE\nTASKS"
 addto DEST "TEXT TO ADD"
 append|app NR "TEXT TO APPEND"
@@ -74,6 +115,7 @@ pri|p NR PRIORITY [NR PRIORITY ...]
 replace NR "UPDATED TODO"
 report
 shorthelp
+start|ip NR [NR ...]            (requires TODOTXT_IN_PROGRESS)
 ```
 
 ## Options
@@ -128,15 +170,92 @@ ${XDG_CONFIG_HOME:-$HOME/.config}/todo/config
 `TODOTXT_PRIORITY_ON_ADD`, `TODOTXT_PRESERVE_LINE_NUMBERS`, `TODOTXT_PLAIN`,
 `TODOTXT_FORCE`, `TODOTXT_VERBOSE`, `TODOTXT_DISABLE_FILTER`,
 `TODOTXT_DEFAULT_ACTION`, `TODOTXT_SOURCEVAR`, `TODOTXT_SIGIL_BEFORE_PATTERN`,
-`TODOTXT_SIGIL_VALID_PATTERN`, `TODOTXT_SIGIL_AFTER_PATTERN`.
+`TODOTXT_SIGIL_VALID_PATTERN`, `TODOTXT_SIGIL_AFTER_PATTERN`,
+`TODOTXT_DATE_TAGS`, `TODOTXT_IN_PROGRESS`, `TODOTXT_RECURRENCE`,
+`TODOTXT_HIDE_FUTURE_TASKS`, `TODOTXT_GIT`, `TODOTXT_GIT_REMOTE`.
+
+## Due dates, thresholds & recurrence
+
+These build on the standard todo.txt `key:value` tag conventions:
+
+* **`due:YYYY-MM-DD`** — a due date. The **`agenda`** action (alias `due`) lists
+  undone tasks that have a `due:` tag, sorted by date:
+
+  ```powershell
+  todo agenda        # tasks due today or overdue
+  todo agenda 7      # add tasks due within the next 7 days
+  todo agenda 7 @work
+  ```
+
+* **`t:YYYY-MM-DD`** — a threshold ("hide until") date. Set
+  **`TODOTXT_HIDE_FUTURE_TASKS=1`** to drop tasks whose `t:` date is still in the
+  future from `ls`/`lsa`/`listpri` (done tasks are never hidden). Off by default.
+
+* **`rec:<n><d|w|m|y>`** — recurrence. With **`TODOTXT_RECURRENCE=1`**, completing
+  a `rec:`-tagged task spawns its next occurrence with `due:` advanced by the
+  interval (and `t:` shifted to preserve its lead time). A leading `+`
+  (`rec:+1m`) is *strict* — it advances from the task's own `due:` date rather
+  than from today. Off by default.
+
+  ```
+  todo add "(B) pay rent rec:+1m due:2026-06-01"
+  todo do 1     # completes it AND adds: (B) pay rent rec:+1m due:2026-07-01
+  ```
+
+  A malformed `rec:` interval is reported and the task is completed without
+  respawning.
+
+## In-progress tracking & date tags
+
+Two optional, independent extensions (both off by default):
+
+* **`TODOTXT_DATE_TAGS=1`** appends a `key:value` tag to tasks: `added:<date>` on
+  `add`, and `completed:<date>` on `do`.
+* **`TODOTXT_IN_PROGRESS=1`** enables the `start` (alias `ip`) action, which marks
+  a task in-progress by prefixing an `i ` status marker (analogous to the `x `
+  done marker) and appending `started:<date>`. The task's priority is preserved:
+
+  ```
+  todo add "(A) write the report"      # (A) write the report
+  todo start 1                         # i (A) write the report started:2026-06-02
+  todo do 1                            # x 2026-06-02 write the report started:... completed:...
+  ```
+
+  A leading `x `/`i ` status marker is transparent to priority, sorting and
+  coloring, so an in-progress `(A)` task still sorts among its priority peers and
+  `pri`/`depri` keep working. `archive` moves only completed (`x `) tasks; `i `
+  tasks stay put. In-progress tasks get their own color (`COLOR_INPROGRESS`).
+
+## Git tracking
+
+Set **`TODOTXT_GIT=1`** to version your todo directory automatically. After any
+file-changing action the CLI runs `git add`/`git commit` in `TODO_DIR`, and
+`git push` when **`TODOTXT_GIT_REMOTE`** is set. The repository is auto-initialized
+(and the remote added) on first use. Read-only actions (`ls`, `listall`, …) never
+commit. If `git` is missing or a git step fails, the command still succeeds but a
+warning is printed and the exit code is `1` — your tasks are never lost to a git
+error.
 
 ## Add-on actions
 
-Unknown actions are resolved against the actions directory (default
-`$TODO_DIR/actions`, or `$TODO_ACTIONS_DIR`). PowerShell (`.ps1`) and native
-executable add-ons are supported and receive the standard `TODO_DIR`,
-`TODO_FILE`, `DONE_FILE`, `REPORT_FILE` environment variables (which are
-restored afterwards, so add-ons never pollute your session).
+Add-ons live in the actions directory (default `$TODO_DIR/actions`, or
+`$TODO_ACTIONS_DIR`) and mirror todo.sh: a script whose name matches an action
+**overrides** the built-in of the same name; any other name adds a brand-new
+command. PowerShell (`.ps1`) and native executables are supported, and receive
+the standard `TODO_DIR`, `TODO_FILE`, `DONE_FILE`, `REPORT_FILE` and `TODO_SH`
+environment variables (restored afterwards, so add-ons never pollute your
+session). `TODO_SH` points at the real wrapper, so an add-on can re-invoke a
+built-in:
+
+```powershell
+# actions/hello.ps1 — a new command
+param() "hi, you have $((Get-Content $env:TODO_FILE).Count) tasks"
+
+# actions/do.ps1 — override `do`, then call the built-in via the escape hatch
+param() & $env:TODO_SH command do @args
+```
+
+Use **`command <action>`** to force the built-in even when an override exists.
 
 ## Differences from `todo.sh`
 
@@ -148,16 +267,27 @@ restored afterwards, so add-ons never pollute your session).
 * `TODOTXT_SORT_COMMAND` / `TODOTXT_FINAL_FILTER` (arbitrary shell pipelines)
   are not supported; list sorting is implemented natively (ordinal,
   case-insensitive, matching `LC_COLLATE=C sort -f -k2`).
+* In-progress (`i `) tasks are sorted by their underlying priority/text (the
+  marker is skipped in the sort key), so an in-progress `(A)` task still sorts
+  among its priority peers. Completed (`x `) tasks still cluster last, exactly as
+  in todo.sh.
+* Adds the `start`/`ip` action, the `added:`/`started:`/`completed:` date tags,
+  and git tracking — all opt-in (see above) and absent from upstream `todo.sh`.
 
 ## Project layout
 
 ```
-todo.ps1                 # CLI entry point (thin wrapper)
-src/TodoTxt.psd1         # module manifest
-src/TodoTxt.psm1         # implementation
-tests/TodoTxt.Tests.ps1  # Pester suite
-tests/Invoke-Tests.ps1   # test runner
-todo.cfg.example         # sample configuration
+todo.ps1                     # CLI entry point (thin wrapper)
+install.ps1                  # interactive installer (iwr | iex)
+src/TodoTxt.psd1             # module manifest
+src/TodoTxt.psm1             # implementation
+tests/TodoTxt.Tests.ps1      # Pester suite
+tests/Install.Tests.ps1      # installer helper tests
+tests/Invoke-Tests.ps1       # test runner (-CI adds NUnit + coverage)
+tests/Invoke-Lint.ps1        # PSScriptAnalyzer runner
+PSScriptAnalyzerSettings.psd1 # lint configuration
+todo.cfg.example             # sample configuration
+CHANGELOG.md                 # release notes
 ```
 
 ## Running the tests
@@ -168,8 +298,12 @@ Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck
 
 # Run the suite:
 pwsh -File tests/Invoke-Tests.ps1
-# CI mode (also writes tests/testresults.xml):
+# CI mode (also writes tests/testresults.xml + JaCoCo tests/coverage.xml and
+# prints a coverage percentage):
 pwsh -File tests/Invoke-Tests.ps1 -CI
+
+# Lint (installs PSScriptAnalyzer on first run with -Install):
+pwsh -File tests/Invoke-Lint.ps1 -Install
 ```
 
 ## License

@@ -33,5 +33,125 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pester-results-${{ matrix.os }}
-          path: tests/testresults.xml
+          path: |
+            tests/testresults.xml
+            tests/coverage.xml
           if-no-files-found: ignore
+
+  lint:
+    name: PSScriptAnalyzer
+    runs-on: ubuntu-latest
+    # Non-blocking for now: the exclude list in PSScriptAnalyzerSettings.psd1 was
+    # chosen from a code read (the analyzer could not be run in the authoring
+    # sandbox). Flip to blocking once a clean baseline is confirmed here.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: pwsh -File tests/Invoke-Lint.ps1
+
+  clear-labels:
+    name: Clear status labels
+    # Runs immediately on each PR event (including a new push / synchronize) so a
+    # stale tests-passing / tests-failing label is cleared while the matrix
+    # re-runs. Same-repo PRs only (fork PRs get a read-only GITHUB_TOKEN).
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Remove existing status labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr edit "$PR" --repo "$REPO" --remove-label tests-passing || true
+          gh pr edit "$PR" --repo "$REPO" --remove-label tests-failing || true
+
+  label:
+    name: Status labels
+    needs: [pester, clear-labels]
+    # After the whole Pester matrix (regardless of outcome): apply tests-passing
+    # on success and a red tests-failing on failure, clearing the opposite.
+    # `needs: clear-labels` orders this after the stale-label clear. Skipped for
+    # pushes to main and for fork PRs (read-only token).
+    if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Apply pass/fail label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          RESULT: ${{ needs.pester.result }}
+        run: |
+          gh label create tests-passing --repo "$REPO" --color 0e8a16 \
+            --description "All CI tests passing" --force || true
+          gh label create tests-failing --repo "$REPO" --color d73a4a \
+            --description "CI tests failing" --force || true
+          if [ "$RESULT" = "success" ]; then
+            gh pr edit "$PR" --repo "$REPO" --add-label tests-passing || true
+            gh pr edit "$PR" --repo "$REPO" --remove-label tests-failing || true
+          else
+            gh pr edit "$PR" --repo "$REPO" --add-label tests-failing || true
+            gh pr edit "$PR" --repo "$REPO" --remove-label tests-passing || true
+          fi
+
+  release:
+    name: Release on version bump
+    needs: pester
+    # On a push to main (i.e. a merged PR) with a green test matrix, cut a
+    # GitHub Release tagged v<ModuleVersion> -- but only when that version has no
+    # release yet, so ordinary merges that don't bump the manifest are no-ops.
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release for a new manifest version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $version = (Import-PowerShellDataFile ./src/TodoTxt.psd1).ModuleVersion
+          $tag = "v$version"
+
+          gh release view $tag --repo $env:REPO *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; nothing to do."
+            exit 0
+          }
+
+          # Use this version's CHANGELOG section as the release notes when present.
+          $notes = ""
+          if (Test-Path ./CHANGELOG.md) {
+            $lines = Get-Content ./CHANGELOG.md
+            $start = ($lines | Select-String -Pattern "^##\s*\[$([regex]::Escape($version))\]" | Select-Object -First 1).LineNumber
+            if ($start) {
+              $body = for ($i = $start; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^##\s*\[') { break }
+                $lines[$i]
+              }
+              $notes = ($body -join "`n").Trim()
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($notes)) { $notes = "Release $tag" }
+
+          $notesFile = New-TemporaryFile
+          Set-Content -Path $notesFile -Value $notes -Encoding utf8
+          gh release create $tag --repo $env:REPO --title $tag --notes-file $notesFile --target $env:GITHUB_SHA
+          Write-Host "Created release $tag."
