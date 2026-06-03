@@ -55,3 +55,31 @@ jobs:
       - name: Run PSScriptAnalyzer
         shell: pwsh
         run: pwsh -File tests/Invoke-Lint.ps1
+
+  label:
+    name: tests-passing label
+    needs: pester
+    # Run after the whole Pester matrix on PRs (regardless of outcome) so the
+    # label is added when tests pass and removed when they don't. Skipped for
+    # pushes to main, where there is no PR to label, and for fork PRs whose
+    # GITHUB_TOKEN is read-only.
+    if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Update tests-passing label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          RESULT: ${{ needs.pester.result }}
+        run: |
+          gh label create tests-passing --repo "$REPO" --color 0e8a16 \
+            --description "All CI tests passing" --force || true
+          if [ "$RESULT" = "success" ]; then
+            gh pr edit "$PR" --repo "$REPO" --add-label tests-passing
+          else
+            gh pr edit "$PR" --repo "$REPO" --remove-label tests-passing || true
+          fi
